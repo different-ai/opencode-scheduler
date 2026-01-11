@@ -12559,6 +12559,7 @@ ${renderLaunchdCalendar(calendar)}
       "    <string>--attach</string>",
       `    <string>${escapePlistString(job.attachUrl)}</string>`
     ] : [],
+    "    <string>--</string>",
     `    <string>${escapePlistString(job.prompt)}</string>`
   ].join(`
 `);
@@ -12634,7 +12635,7 @@ Description=OpenCode Job: ${job.name}
 Type=oneshot
 WorkingDirectory=${workdir}
 Environment="PATH=${enhancedPath}"
-ExecStart=${opencode} run${attachArgs} "${escapeSystemdArg(job.prompt)}"
+ExecStart=${opencode} run${attachArgs} -- "${escapeSystemdArg(job.prompt)}"
 StandardOutput=append:${logPath}
 StandardError=append:${logPath}
 
@@ -12775,7 +12776,7 @@ function buildOpencodeArgs(job) {
   if (job.attachUrl) {
     args.push("--attach", job.attachUrl);
   }
-  args.push(job.prompt);
+  args.push("--", job.prompt);
   return { command, args };
 }
 function buildRunEnvironment() {
