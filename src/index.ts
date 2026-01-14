@@ -16,7 +16,7 @@ import { tool } from "@opencode-ai/plugin"
 import { createWriteStream, existsSync, mkdirSync, readdirSync, readFileSync, writeFileSync, unlinkSync } from "fs"
 import { dirname, join } from "path"
 import { homedir, platform } from "os"
-import { execSync, spawn, type ChildProcess } from "child_process"
+import { execFileSync, execSync, spawn, type ChildProcess } from "child_process"
 import { fileURLToPath } from "url"
 
 // Storage location - shared with other opencode tools
@@ -214,6 +214,33 @@ function getBuiltinSkill(name?: string): BuiltinSkill | undefined {
 
 function listBuiltinSkills(): BuiltinSkill[] {
   return Object.values(BUILTIN_SKILLS)
+}
+
+function installBuiltinSkill(skill: BuiltinSkill, rootDir: string, overwrite = false): { directory: string; files: string[] } {
+  const installRoot = rootDir.trim()
+  if (!installRoot) {
+    throw new Error("Install directory cannot be empty.")
+  }
+
+  if (!existsSync(installRoot)) {
+    throw new Error(`Directory not found: ${installRoot}`)
+  }
+
+  const relativeDir = dirname(skill.suggestedPath)
+  const installDir = join(installRoot, relativeDir)
+  ensureDir(installDir)
+
+  const files: string[] = []
+  for (const [filename, content] of Object.entries(skill.files)) {
+    const targetPath = join(installDir, filename)
+    if (existsSync(targetPath) && !overwrite) {
+      throw new Error(`File already exists: ${targetPath} (pass overwrite=true to replace)`)
+    }
+    writeFileSync(targetPath, `${content.trimEnd()}\n`)
+    files.push(targetPath)
+  }
+
+  return { directory: installDir, files }
 }
 
 function loadPackageInfo(): { name: string; version: string } {
@@ -903,12 +930,32 @@ function formatJobDetails(job: Job): string {
   return lines.join("\n")
 }
 
-function getJobLogs(slug: string): string | null {
+function getJobLogs(slug: string, options?: { tailLines?: number; maxChars?: number }): string | null {
   const logPath = getLogPath(slug)
   if (!existsSync(logPath)) return null
+
+  const maxChars = options?.maxChars ?? 5000
+  const tailLines = options?.tailLines
+
   try {
+    if (typeof tailLines === "number" && Number.isFinite(tailLines) && tailLines > 0) {
+      const clampedLines = Math.max(1, Math.min(5000, Math.floor(tailLines)))
+
+      try {
+        const output = execFileSync("tail", ["-n", String(clampedLines), logPath], {
+          env: buildRunEnvironment(),
+        }).toString()
+        return output.length > maxChars ? output.slice(-maxChars) : output
+      } catch {
+        const content = readFileSync(logPath, "utf-8")
+        const lines = content.split(/\r?\n/)
+        const output = lines.slice(-clampedLines).join("\n")
+        return output.length > maxChars ? output.slice(-maxChars) : output
+      }
+    }
+
     const content = readFileSync(logPath, "utf-8")
-    return content.length > 5000 ? content.slice(-5000) : content
+    return content.length > maxChars ? content.slice(-maxChars) : content
   } catch {
     return null
   }
@@ -1101,6 +1148,58 @@ Commands:
         },
       }),
 
+      install_skill: tool({
+        description: "Install a built-in skill into your repo's .opencode/skill directory.",
+        args: {
+          name: tool.schema
+            .string()
+            .optional()
+            .describe("Skill name (default: scheduled-job-best-practices)"),
+          directory: tool.schema
+            .string()
+            .optional()
+            .describe("Repo root directory to install into (defaults to current directory)."),
+          overwrite: tool.schema.boolean().optional().describe("Overwrite existing files (default false)."),
+          format: tool.schema.string().optional().describe("Optional: output format ('text' or 'json')."),
+        },
+        async execute(args) {
+          const format = normalizeFormat(args.format)
+          const skill = getBuiltinSkill(args.name)
+
+          if (!skill) {
+            const available = listBuiltinSkills()
+              .map((s) => s.name)
+              .join(", ")
+            const requested = (args.name ?? "").trim()
+            const label = requested ? `"${requested}"` : "that name"
+            return errorResult(format, `No built-in skill found for ${label}. Available: ${available || "(none)"}`)
+          }
+
+          const directory = args.directory ?? process.cwd()
+          const overwrite = args.overwrite === true
+
+          try {
+            const installed = installBuiltinSkill(skill, directory, overwrite)
+            const files = installed.files.map((file) => `- ${file}`).join("\n")
+
+            const output = [
+              `Installed skill: ${skill.name}`,
+              `Directory: ${installed.directory}`,
+              "",
+              "Files:",
+              files,
+              "",
+              `Next: add @${skill.name} to the top of scheduled job prompts.`,
+            ].join("\n")
+
+            return okResult(format, output, { skill, installed })
+          } catch (error) {
+            const msg = error instanceof Error ? error.message : String(error)
+            return errorResult(format, `Failed to install skill: ${msg}`)
+          }
+        },
+      }),
+
       get_job: tool({
 
         description: "Get details for a scheduled job",
@@ -1265,6 +1364,10 @@ Commands:
         description: "View the latest logs from a scheduled job",
         args: {
           name: tool.schema.string().describe("The job name or slug"),
+          lines: tool.schema
+            .number()
+            .optional()
+            .describe("Number of lines from the end of the log (default 200)."),
           format: tool.schema.string().optional().describe("Optional: output format ('text' or 'json')."),
         },
         async execute(args) {
@@ -1275,7 +1378,8 @@ Commands:
             return errorResult(format, `Job "${args.name}" not found.`)
           }
 
-          const logs = getJobLogs(job.slug)
+          const tailLines = typeof args.lines === "number" && Number.isFinite(args.lines) ? args.lines : 200
+          const logs = getJobLogs(job.slug, { tailLines, maxChars: 20000 })
           const logPath = getLogPath(job.slug)
 
           if (!logs) {

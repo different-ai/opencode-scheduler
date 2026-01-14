@@ -42,7 +42,7 @@ Schedule a job every 6 hours to check if my website is up and alert me on Slack 
 | Schedule a job | `Schedule a daily job at 9am to...` |
 | List jobs | `Show my scheduled jobs` |
 | Get version | `Show scheduler version` |
-| Get skill template | `Get the scheduled job best practices skill` |
+| Install skill template | `Install the scheduled job best practices skill` |
 | Get job | `Show details for standing-desk` |
 | Update job | `Update standing-desk to run at 10am` |
 | Run immediately | `Run the standing-desk job now` |
@@ -93,11 +93,12 @@ Jobs use standard 5-field cron expressions:
 | `list_jobs` | List all scheduled jobs |
 | `get_version` | Show scheduler and opencode versions |
 | `get_skill` | Get built-in skill templates (best practices) |
+| `install_skill` | Install a built-in skill into your repo |
 | `get_job` | Fetch job details and metadata |
 | `update_job` | Update an existing job |
 | `delete_job` | Remove a scheduled job |
 | `run_job` | Execute a job immediately (fire-and-forget) |
-| `job_logs` | View logs from a job |
+| `job_logs` | View the latest logs from a job |
 
 Tools accept an optional `format: "json"` argument to return structured output with `success`, `output`, `shouldContinue`, and `data`.
 
@@ -138,11 +139,15 @@ Update the standing-desk job to use attachUrl http://localhost:4096
 
 ### Built-in Skill Templates
 
-To install the built-in skill into your project, open OpenCode in your repo and run this prompt:
+To install the built-in skill into your project (no copy/paste), open OpenCode in your repo and run:
 
 ```
-Get skill from opencode-scheduler and add it to my skills
+Install the scheduled job best practices skill
 ```
+
+This calls the plugin’s `install_skill` tool and writes `.opencode/skill/scheduled-job-best-practices/SKILL.md`.
+
+(If you prefer, you can also say: `Get skill from opencode-scheduler and add it to my skills`.)
 
 Then add `@scheduled-job-best-practices` at the top of scheduled job prompts.
 

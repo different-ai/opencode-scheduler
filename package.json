@@ -1,6 +1,6 @@
 {
   "name": "opencode-scheduler",
-  "version": "1.0.2",
+  "version": "1.0.3",
   "description": "OpenCode plugin for scheduling recurring jobs using launchd (Mac) or systemd (Linux)",
   "main": "dist/index.js",
   "types": "dist/index.d.ts",
