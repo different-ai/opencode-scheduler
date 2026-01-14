@@ -42,6 +42,7 @@ Schedule a job every 6 hours to check if my website is up and alert me on Slack 
 | Schedule a job | `Schedule a daily job at 9am to...` |
 | List jobs | `Show my scheduled jobs` |
 | Get version | `Show scheduler version` |
+| Get skill template | `Get the scheduled job best practices skill` |
 | Get job | `Show details for standing-desk` |
 | Update job | `Update standing-desk to run at 10am` |
 | Run immediately | `Run the standing-desk job now` |
@@ -91,6 +92,7 @@ Jobs use standard 5-field cron expressions:
 | `schedule_job` | Create a new scheduled job |
 | `list_jobs` | List all scheduled jobs |
 | `get_version` | Show scheduler and opencode versions |
+| `get_skill` | Get built-in skill templates (best practices) |
 | `get_job` | Fetch job details and metadata |
 | `update_job` | Update an existing job |
 | `delete_job` | Remove a scheduled job |
@@ -125,6 +127,18 @@ If you have an OpenCode backend running via `opencode serve` or `opencode web`, 
 ```
 Update the standing-desk job to use attachUrl http://localhost:4096
 ```
+
+## Project Philosophy
+
+- This plugin is intentionally a thin wrapper: it schedules `opencode run` via launchd (Mac) or systemd (Linux).
+- We avoid prompt “injection” as a feature. If a job needs dynamic values (dates, paths, etc.), the prompt should compute them at runtime using tools.
+- Prefer non-interactive dependencies for scheduled runs (e.g., Telegram Bot API over `web.telegram.org`).
+- Logs are the source of truth for scheduled runs: `~/.config/opencode/logs/*.log`.
+- Resiliency/reporting roadmap (not implemented): `PRD-resilient-execution.md`.
+
+### Built-in Skill Templates
+
+Use `get_skill` to fetch `scheduled-job-best-practices`, copy it into your repo, then add `@scheduled-job-best-practices` at the top of scheduled job prompts.
 
 ## Troubleshooting
 
