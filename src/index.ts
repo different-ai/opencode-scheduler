@@ -1540,22 +1540,7 @@ Commands:
       list_jobs: tool({
         description: "List all scheduled jobs. Optionally filter by source app.",
         args: {
-          name: tool.schema.string().describe("The job name or slug"),
-          // Optional overrides for a one-off run
-          prompt: tool.schema.string().optional().describe("Override prompt for this run"),
-          command: tool.schema.string().optional().describe("Override command for this run"),
-          arguments: tool.schema.string().optional().describe("Override arguments for command mode"),
-          files: tool.schema.string().optional().describe("Override comma-separated files/dirs to attach"),
-          agent: tool.schema.string().optional().describe("Override agent"),
-          model: tool.schema.string().optional().describe("Override model"),
-          variant: tool.schema.string().optional().describe("Override variant"),
-          title: tool.schema.string().optional().describe("Override title"),
-          share: tool.schema.boolean().optional().describe("Override share flag"),
-          continue: tool.schema.boolean().optional().describe("Override continue flag"),
-          session: tool.schema.string().optional().describe("Override session id"),
-          runFormat: tool.schema.string().optional().describe("Override run output format (default|json)"),
-          port: tool.schema.number().optional().describe("Override port"),
-          attachUrl: tool.schema.string().optional().describe("Override attach URL"),
+          source: tool.schema.string().optional().describe("Filter by source app (e.g. 'marketplace')"),
           format: tool.schema.string().optional().describe("Optional: output format ('text' or 'json')."),
         },
 
@@ -1908,6 +1893,21 @@ Commands:
         description: "Run a scheduled job immediately",
         args: {
           name: tool.schema.string().describe("The job name or slug"),
+          // Optional overrides for a one-off run
+          prompt: tool.schema.string().optional().describe("Override prompt for this run"),
+          command: tool.schema.string().optional().describe("Override command for this run"),
+          arguments: tool.schema.string().optional().describe("Override arguments for command mode"),
+          files: tool.schema.string().optional().describe("Override comma-separated files/dirs to attach"),
+          agent: tool.schema.string().optional().describe("Override agent"),
+          model: tool.schema.string().optional().describe("Override model"),
+          variant: tool.schema.string().optional().describe("Override variant"),
+          title: tool.schema.string().optional().describe("Override title"),
+          share: tool.schema.boolean().optional().describe("Override share flag"),
+          continue: tool.schema.boolean().optional().describe("Override continue flag"),
+          session: tool.schema.string().optional().describe("Override session id"),
+          runFormat: tool.schema.string().optional().describe("Override run output format (default|json)"),
+          port: tool.schema.number().optional().describe("Override port"),
+          attachUrl: tool.schema.string().optional().describe("Override attach URL"),
           format: tool.schema.string().optional().describe("Optional: output format ('text' or 'json')."),
         },
         async execute(args) {

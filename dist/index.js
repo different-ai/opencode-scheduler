@@ -12511,10 +12511,24 @@ function loadPackageInfo() {
   }
 }
 function findOpencode() {
+  const override = process.env.OPENCODE_SCHEDULER_OPENCODE_PATH?.trim();
+  if (override)
+    return override;
+  try {
+    const resolved = execSync("command -v opencode", {
+      env: { ...process.env, PATH: getEnhancedPath() + ":" + (process.env.PATH ?? "") },
+      stdio: ["ignore", "pipe", "ignore"]
+    }).toString().trim();
+    if (resolved) {
+      if (resolved.includes("/"))
+        return resolved;
+      return "opencode";
+    }
+  } catch {}
   const paths = [
-    join(homedir(), ".opencode", "bin", "opencode"),
+    "/opt/homebrew/bin/opencode",
     "/usr/local/bin/opencode",
-    "/opt/homebrew/bin/opencode"
+    join(homedir(), ".opencode", "bin", "opencode")
   ];
   for (const p of paths) {
     if (existsSync(p)) {
@@ -12672,7 +12686,6 @@ function cronToSystemdCalendars(cron) {
   return calendars;
 }
 function createLaunchdPlist(job) {
-  const opencode = findOpencode();
   const label = `${LAUNCHD_PREFIX}.${job.slug}`;
   const logPath = join(LOGS_DIR, `${job.slug}.log`);
   const calendars = cronToLaunchdCalendars(job.schedule);
@@ -12684,15 +12697,12 @@ ${renderLaunchdCalendar(calendar)}
   </dict>`).join(`
 `)}
   </array>`;
-  const programArguments = [
-    `    <string>${escapePlistString(opencode)}</string>`,
-    "    <string>run</string>",
-    ...job.attachUrl ? [
-      "    <string>--attach</string>",
-      `    <string>${escapePlistString(job.attachUrl)}</string>`
-    ] : [],
-    "    <string>--</string>",
-    `    <string>${escapePlistString(job.prompt)}</string>`
+  const invocation = buildOpencodeArgs(job);
+  const programArguments = invocation.args.map((arg) => `    <string>${escapePlistString(arg)}</string>`).join(`
+`);
+  const programArgumentsXml = [
+    `    <string>${escapePlistString(invocation.command)}</string>`,
+    programArguments
   ].join(`
 `);
   const workdir = job.workdir || homedir();
@@ -12715,7 +12725,7 @@ ${renderLaunchdCalendar(calendar)}
   
   <key>ProgramArguments</key>
   <array>
-${programArguments}
+${programArgumentsXml}
   </array>
   
   <key>StartCalendarInterval</key>
@@ -12755,11 +12765,11 @@ function uninstallLaunchdJob(slug) {
   }
 }
 function createSystemdService(job) {
-  const opencode = findOpencode();
   const logPath = join(LOGS_DIR, `${job.slug}.log`);
   const workdir = job.workdir || homedir();
   const enhancedPath = getEnhancedPath();
-  const attachArgs = job.attachUrl ? ` --attach "${escapeSystemdArg(job.attachUrl)}"` : "";
+  const invocation = buildOpencodeArgs(job);
+  const escapedArgs = invocation.args.map((arg) => `"${escapeSystemdArg(arg)}"`).join(" ");
   return `[Unit]
 Description=OpenCode Job: ${job.name}
 
@@ -12767,7 +12777,7 @@ Description=OpenCode Job: ${job.name}
 Type=oneshot
 WorkingDirectory=${workdir}
 Environment="PATH=${enhancedPath}"
-ExecStart=${opencode} run${attachArgs} -- "${escapeSystemdArg(job.prompt)}"
+ExecStart=${invocation.command} ${escapedArgs}
 StandardOutput=append:${logPath}
 StandardError=append:${logPath}
 
@@ -12838,7 +12848,7 @@ function loadJob(slug) {
   if (!existsSync(path))
     return null;
   try {
-    return JSON.parse(readFileSync(path, "utf-8"));
+    return normalizeJob(JSON.parse(readFileSync(path, "utf-8")));
   } catch {
     return null;
   }
@@ -12848,7 +12858,7 @@ function loadAllJobs() {
   const files = readdirSync(JOBS_DIR).filter((f) => f.endsWith(".json"));
   return files.map((f) => {
     try {
-      return JSON.parse(readFileSync(join(JOBS_DIR, f), "utf-8"));
+      return normalizeJob(JSON.parse(readFileSync(join(JOBS_DIR, f), "utf-8")));
     } catch {
       return null;
     }
@@ -12857,7 +12867,7 @@ function loadAllJobs() {
 function saveJob(job) {
   ensureDir(JOBS_DIR);
   const path = join(JOBS_DIR, `${job.slug}.json`);
-  writeFileSync(path, JSON.stringify(job, null, 2));
+  writeFileSync(path, JSON.stringify(sanitizeJob(job), null, 2));
 }
 function deleteJobFile(slug) {
   const path = join(JOBS_DIR, `${slug}.json`);
@@ -12877,6 +12887,208 @@ function normalizeAttachUrl(attachUrl) {
     throw new Error(`Invalid attach URL: ${attachUrl}`);
   }
   return trimmed;
+}
+function isRecord(value) {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+function normalizeRunFormat(value) {
+  if (typeof value !== "string")
+    return;
+  const trimmed = value.trim();
+  if (trimmed === "json")
+    return "json";
+  if (trimmed === "default")
+    return "default";
+  return;
+}
+function parseRunFormatInput(value) {
+  if (value === undefined)
+    return;
+  if (typeof value === "string" && !value.trim())
+    return;
+  const normalized = normalizeRunFormat(value);
+  if (normalized)
+    return normalized;
+  throw new Error(`Invalid runFormat: ${String(value)} (expected: default | json)`);
+}
+function normalizeRunSpec(run) {
+  const normalized = { ...run };
+  if (typeof normalized.prompt === "string") {
+    const trimmed = normalized.prompt.trim();
+    normalized.prompt = trimmed ? trimmed : undefined;
+  }
+  if (typeof normalized.command === "string") {
+    const trimmed = normalized.command.trim();
+    normalized.command = trimmed ? trimmed : undefined;
+  }
+  if (typeof normalized.arguments === "string") {
+    const trimmed = normalized.arguments.trim();
+    normalized.arguments = trimmed ? trimmed : undefined;
+  }
+  if (Array.isArray(normalized.files)) {
+    const files = normalized.files.map((file2) => String(file2).trim()).filter(Boolean);
+    normalized.files = files.length ? files : undefined;
+  }
+  if (typeof normalized.agent === "string") {
+    const trimmed = normalized.agent.trim();
+    normalized.agent = trimmed ? trimmed : undefined;
+  }
+  if (typeof normalized.model === "string") {
+    const trimmed = normalized.model.trim();
+    normalized.model = trimmed ? trimmed : undefined;
+  }
+  if (typeof normalized.variant === "string") {
+    const trimmed = normalized.variant.trim();
+    normalized.variant = trimmed ? trimmed : undefined;
+  }
+  if (typeof normalized.title === "string") {
+    const trimmed = normalized.title.trim();
+    normalized.title = trimmed ? trimmed : undefined;
+  }
+  if (normalized.share !== true) {
+    normalized.share = undefined;
+  }
+  if (normalized.continue !== true) {
+    normalized.continue = undefined;
+  }
+  if (typeof normalized.session === "string") {
+    const trimmed = normalized.session.trim();
+    normalized.session = trimmed ? trimmed : undefined;
+  }
+  if (normalized.runFormat !== "json") {
+    normalized.runFormat = normalized.runFormat === "default" ? "default" : undefined;
+  }
+  if (typeof normalized.attachUrl === "string") {
+    const trimmed = normalized.attachUrl.trim();
+    normalized.attachUrl = trimmed ? trimmed : undefined;
+  }
+  if (typeof normalized.port === "number" && Number.isFinite(normalized.port)) {
+    normalized.port = Math.floor(normalized.port);
+    if (normalized.port <= 0)
+      normalized.port = undefined;
+  } else {
+    normalized.port = undefined;
+  }
+  return normalized;
+}
+function validateRunSpec(run) {
+  const hasPrompt = typeof run.prompt === "string" && run.prompt.trim().length > 0;
+  const hasCommand = typeof run.command === "string" && run.command.trim().length > 0;
+  if (!hasPrompt && !hasCommand) {
+    throw new Error("Job must have either run.prompt or run.command");
+  }
+  if (hasPrompt && hasCommand) {
+    throw new Error("Job cannot specify both run.prompt and run.command");
+  }
+  if (hasCommand && run.arguments !== undefined && typeof run.arguments !== "string") {
+    throw new Error("run.arguments must be a string");
+  }
+  if (run.attachUrl !== undefined) {
+    normalizeAttachUrl(run.attachUrl);
+  }
+  if (run.port !== undefined) {
+    if (!Number.isFinite(run.port) || run.port <= 0) {
+      throw new Error("run.port must be a positive integer");
+    }
+  }
+  if (run.runFormat !== undefined && run.runFormat !== "default" && run.runFormat !== "json") {
+    throw new Error("run.runFormat must be 'default' or 'json'");
+  }
+}
+function getJobRun(job) {
+  if (job.run) {
+    return job.run;
+  }
+  const fallbackPrompt = (job.prompt ?? "").trim();
+  if (!fallbackPrompt) {
+    throw new Error(`Job "${job.slug}" is missing a prompt. Update the job to include run.prompt or prompt.`);
+  }
+  return {
+    prompt: fallbackPrompt,
+    attachUrl: job.attachUrl
+  };
+}
+function sanitizeJob(job) {
+  const sanitized = { ...job };
+  if (sanitized.run) {
+    const normalized = normalizeRunSpec(sanitized.run);
+    validateRunSpec(normalized);
+    sanitized.run = normalized;
+  }
+  if (sanitized.attachUrl !== undefined) {
+    sanitized.attachUrl = normalizeAttachUrl(sanitized.attachUrl);
+  }
+  if (sanitized.prompt !== undefined) {
+    const trimmed = sanitized.prompt.trim();
+    sanitized.prompt = trimmed ? trimmed : undefined;
+  }
+  return sanitized;
+}
+function normalizeJobRun(raw) {
+  if (!isRecord(raw))
+    return;
+  const run = {};
+  if (typeof raw.prompt === "string")
+    run.prompt = raw.prompt;
+  if (typeof raw.command === "string")
+    run.command = raw.command;
+  if (typeof raw.arguments === "string")
+    run.arguments = raw.arguments;
+  if (Array.isArray(raw.files)) {
+    run.files = raw.files.map((file2) => String(file2));
+  }
+  if (typeof raw.agent === "string")
+    run.agent = raw.agent;
+  if (typeof raw.model === "string")
+    run.model = raw.model;
+  if (typeof raw.variant === "string")
+    run.variant = raw.variant;
+  if (typeof raw.title === "string")
+    run.title = raw.title;
+  if (typeof raw.share === "boolean")
+    run.share = raw.share;
+  if (typeof raw.continue === "boolean")
+    run.continue = raw.continue;
+  if (typeof raw.session === "string")
+    run.session = raw.session;
+  const runFormat = normalizeRunFormat(raw.runFormat);
+  if (runFormat)
+    run.runFormat = runFormat;
+  if (typeof raw.attachUrl === "string")
+    run.attachUrl = raw.attachUrl;
+  if (typeof raw.port === "number" && Number.isFinite(raw.port)) {
+    run.port = raw.port;
+  }
+  return run;
+}
+function normalizeJob(raw) {
+  if (!isRecord(raw))
+    return null;
+  if (typeof raw.slug !== "string" || typeof raw.name !== "string" || typeof raw.schedule !== "string") {
+    return null;
+  }
+  const job = {
+    slug: raw.slug,
+    name: raw.name,
+    schedule: raw.schedule,
+    source: typeof raw.source === "string" ? raw.source : undefined,
+    workdir: typeof raw.workdir === "string" ? raw.workdir : undefined,
+    createdAt: typeof raw.createdAt === "string" ? raw.createdAt : new Date().toISOString(),
+    updatedAt: typeof raw.updatedAt === "string" ? raw.updatedAt : undefined,
+    lastRunAt: typeof raw.lastRunAt === "string" ? raw.lastRunAt : undefined,
+    lastRunExitCode: typeof raw.lastRunExitCode === "number" ? raw.lastRunExitCode : undefined,
+    lastRunError: typeof raw.lastRunError === "string" ? raw.lastRunError : undefined,
+    lastRunSource: raw.lastRunSource === "manual" || raw.lastRunSource === "scheduled" ? raw.lastRunSource : undefined,
+    lastRunStatus: raw.lastRunStatus === "running" || raw.lastRunStatus === "success" || raw.lastRunStatus === "failed" ? raw.lastRunStatus : undefined
+  };
+  if (typeof raw.prompt === "string")
+    job.prompt = raw.prompt;
+  if (typeof raw.attachUrl === "string")
+    job.attachUrl = raw.attachUrl;
+  const run = normalizeJobRun(raw.run);
+  if (run)
+    job.run = run;
+  return sanitizeJob(job);
 }
 function findJobByName(name) {
   const slug = slugify(name);
@@ -12904,20 +13116,70 @@ function getLogPath(slug) {
 }
 function buildOpencodeArgs(job) {
   const command = findOpencode();
+  const run = normalizeRunSpec(getJobRun(job));
+  validateRunSpec(run);
   const args = ["run"];
-  if (job.attachUrl) {
-    args.push("--attach", job.attachUrl);
+  if (run.attachUrl) {
+    args.push("--attach", run.attachUrl);
   }
-  args.push("--", job.prompt);
+  if (run.port !== undefined) {
+    args.push("--port", String(run.port));
+  }
+  if (run.command) {
+    args.push("--command", run.command);
+  }
+  if (run.agent) {
+    args.push("--agent", run.agent);
+  }
+  if (run.model) {
+    args.push("--model", run.model);
+  }
+  if (run.variant) {
+    args.push("--variant", run.variant);
+  }
+  if (run.runFormat) {
+    args.push("--format", run.runFormat);
+  }
+  if (run.share) {
+    args.push("--share");
+  }
+  if (run.title) {
+    args.push("--title", run.title);
+  }
+  if (run.continue) {
+    args.push("--continue");
+  }
+  if (run.session) {
+    args.push("--session", run.session);
+  }
+  for (const file2 of run.files ?? []) {
+    args.push("--file", file2);
+  }
+  args.push("--");
+  args.push(run.command ? run.arguments ?? "" : run.prompt ?? "");
   return { command, args };
 }
 function buildRunEnvironment() {
   const enhancedPath = getEnhancedPath();
   const existingPath = process.env.PATH;
   const combinedPath = existingPath ? `${enhancedPath}:${existingPath}` : enhancedPath;
+  const basePolicy = { question: "deny" };
+  const mergedPolicy = (() => {
+    const raw = process.env.OPENCODE_PERMISSION;
+    if (!raw)
+      return basePolicy;
+    try {
+      const existing = JSON.parse(raw);
+      if (isRecord(existing)) {
+        return { ...existing, ...basePolicy };
+      }
+    } catch {}
+    return basePolicy;
+  })();
   return {
     ...process.env,
-    PATH: combinedPath
+    PATH: combinedPath,
+    OPENCODE_PERMISSION: JSON.stringify(mergedPolicy)
   };
 }
 function getOpencodeVersion(opencodePath) {
@@ -13035,10 +13297,58 @@ function formatJobDetails(job) {
     `Schedule: ${job.schedule} (${describeCron(job.schedule)})`,
     `Working Directory: ${job.workdir || homedir()}`
   ];
-  if (job.attachUrl) {
+  const run = (() => {
+    try {
+      return normalizeRunSpec(getJobRun(job));
+    } catch {
+      return;
+    }
+  })();
+  if (run?.attachUrl) {
+    lines.push(`Attach URL: ${run.attachUrl}`);
+  } else if (job.attachUrl) {
     lines.push(`Attach URL: ${job.attachUrl}`);
   }
-  lines.push(`Prompt: ${job.prompt}`);
+  if (run?.command) {
+    lines.push(`Command: ${run.command}`);
+    if (run.arguments)
+      lines.push(`Arguments: ${run.arguments}`);
+  }
+  if (run?.prompt) {
+    lines.push(`Prompt: ${run.prompt}`);
+  } else if (job.prompt) {
+    lines.push(`Prompt: ${job.prompt}`);
+  }
+  if (run?.files?.length) {
+    lines.push(`Files: ${run.files.join(", ")}`);
+  }
+  if (run?.agent) {
+    lines.push(`Agent: ${run.agent}`);
+  }
+  if (run?.model) {
+    lines.push(`Model: ${run.model}`);
+  }
+  if (run?.variant) {
+    lines.push(`Variant: ${run.variant}`);
+  }
+  if (run?.runFormat) {
+    lines.push(`Run Format: ${run.runFormat}`);
+  }
+  if (run?.title) {
+    lines.push(`Title: ${run.title}`);
+  }
+  if (run?.share) {
+    lines.push("Share: true");
+  }
+  if (run?.continue) {
+    lines.push("Continue: true");
+  }
+  if (run?.session) {
+    lines.push(`Session: ${run.session}`);
+  }
+  if (run?.port !== undefined) {
+    lines.push(`Port: ${run.port}`);
+  }
   lines.push(`Created: ${job.createdAt}`);
   if (job.updatedAt) {
     lines.push(`Updated: ${job.updatedAt}`);
@@ -13097,7 +13407,19 @@ var SchedulerPlugin = async () => {
         args: {
           name: tool.schema.string().describe("A short name for the job (e.g. 'standing desk search')"),
           schedule: tool.schema.string().describe("Cron expression: '0 9 * * *' (daily 9am), '0 */6 * * *' (every 6h), '30 8 * * 1' (Monday 8:30am)"),
-          prompt: tool.schema.string().describe("The prompt to run"),
+          prompt: tool.schema.string().optional().describe("Prompt to run (legacy; prefer run fields)"),
+          command: tool.schema.string().optional().describe("Optional: opencode command to run (maps to --command)"),
+          arguments: tool.schema.string().optional().describe("Optional: arguments string for command mode"),
+          files: tool.schema.string().optional().describe("Optional: comma-separated list of files/dirs to attach (maps to repeated --file)"),
+          agent: tool.schema.string().optional().describe("Optional: agent to use (maps to --agent)"),
+          model: tool.schema.string().optional().describe("Optional: model to use (maps to --model)"),
+          variant: tool.schema.string().optional().describe("Optional: model variant (maps to --variant)"),
+          title: tool.schema.string().optional().describe("Optional: session title (maps to --title)"),
+          share: tool.schema.boolean().optional().describe("Optional: share session (maps to --share)"),
+          continue: tool.schema.boolean().optional().describe("Optional: continue last session (maps to --continue)"),
+          session: tool.schema.string().optional().describe("Optional: session id (maps to --session)"),
+          runFormat: tool.schema.string().optional().describe("Optional: run output format (maps to opencode --format: default|json)"),
+          port: tool.schema.number().optional().describe("Optional: server port for local server (maps to --port)"),
           source: tool.schema.string().optional().describe("Optional: source app (e.g. 'marketplace') - used for filtering"),
           workdir: tool.schema.string().optional().describe("Optional: working directory to run from (for MCP config). Defaults to current directory."),
           attachUrl: tool.schema.string().optional().describe("Optional: attach URL for opencode run (e.g. http://localhost:4096)."),
@@ -13108,6 +13430,43 @@ var SchedulerPlugin = async () => {
           const slug = args.source ? `${args.source}-${slugify(args.name)}` : slugify(args.name);
           if (loadJob(slug)) {
             return errorResult(format, `Job "${slug}" already exists. Delete it first or use a different name.`);
+          }
+          const parseFiles = (raw) => {
+            if (raw === undefined)
+              return;
+            if (typeof raw !== "string")
+              return;
+            const items = raw.split(",").map((item) => item.trim()).filter(Boolean);
+            return items.length ? items : undefined;
+          };
+          let runFormat;
+          try {
+            runFormat = parseRunFormatInput(args.runFormat);
+          } catch (error45) {
+            const msg = error45 instanceof Error ? error45.message : String(error45);
+            return errorResult(format, msg);
+          }
+          const run = {
+            prompt: args.prompt,
+            command: args.command,
+            arguments: args.arguments,
+            files: parseFiles(args.files),
+            agent: args.agent,
+            model: args.model,
+            variant: args.variant,
+            title: args.title,
+            share: args.share,
+            continue: args.continue,
+            session: args.session,
+            runFormat,
+            attachUrl: args.attachUrl,
+            port: args.port
+          };
+          try {
+            validateRunSpec(normalizeRunSpec(run));
+          } catch (error45) {
+            const msg = error45 instanceof Error ? error45.message : String(error45);
+            return errorResult(format, `Invalid run spec: ${msg}`);
           }
           let attachUrl;
           try {
@@ -13127,6 +13486,7 @@ var SchedulerPlugin = async () => {
             slug,
             name: args.name,
             schedule: args.schedule,
+            run: normalizeRunSpec(run),
             prompt: args.prompt,
             source: args.source,
             workdir,
@@ -13137,14 +13497,15 @@ var SchedulerPlugin = async () => {
             saveJob(job);
             installJob(job);
             const platformName = IS_MAC ? "launchd" : IS_LINUX ? "systemd" : "unknown";
-            const attachLine = attachUrl ? `Attach URL: ${attachUrl}
+            const primaryLine = run.command ? `Command: ${run.command}${run.arguments ? ` ${run.arguments}` : ""}` : `Prompt: ${(run.prompt ?? "").slice(0, 100)}${(run.prompt ?? "").length > 100 ? "..." : ""}`;
+            const attachLine = run.attachUrl ? `Attach URL: ${run.attachUrl}
 ` : "";
             return okResult(format, `Scheduled "${args.name}"
 
 Schedule: ${args.schedule} (${describeCron(args.schedule)})
 Platform: ${platformName}
 Working Directory: ${workdir}
-${attachLine}Prompt: ${args.prompt.slice(0, 100)}${args.prompt.length > 100 ? "..." : ""}
+${attachLine}${primaryLine}
 
 The job will run at the scheduled time. If your computer was asleep, it will catch up when it wakes.
 
@@ -13178,9 +13539,19 @@ Try: "Schedule a daily job at 9am to search for standing desks"`;
             return okResult(format, message, { jobs: [] });
           }
           const lines = jobs.map((j, i) => {
+            const run = (() => {
+              try {
+                return normalizeRunSpec(getJobRun(j));
+              } catch {
+                return;
+              }
+            })();
+            const preview = run?.command ? `${run.command}${run.arguments ? ` ${run.arguments}` : ""}` : run?.prompt ?? j.prompt ?? "(missing prompt)";
+            const trimmed = preview.trim();
+            const snippet = trimmed.slice(0, 50) + (trimmed.length > 50 ? "..." : "");
             return `${i + 1}. ${j.name} (${j.slug})
    ${describeCron(j.schedule)}
-   ${j.prompt.slice(0, 50)}${j.prompt.length > 50 ? "..." : ""}`;
+   ${snippet}`;
           });
           return okResult(format, `Scheduled Jobs
 
@@ -13304,7 +13675,19 @@ ${content.trim()}
         args: {
           name: tool.schema.string().describe("The job name or slug"),
           schedule: tool.schema.string().optional().describe("Updated cron expression"),
-          prompt: tool.schema.string().optional().describe("Updated prompt"),
+          prompt: tool.schema.string().optional().describe("Updated prompt (legacy; prefer command/arguments/etc)"),
+          command: tool.schema.string().optional().describe("Updated opencode command (maps to --command)"),
+          arguments: tool.schema.string().optional().describe("Updated command arguments string"),
+          files: tool.schema.string().optional().describe("Updated comma-separated list of files/dirs to attach"),
+          agent: tool.schema.string().optional().describe("Updated agent (maps to --agent)"),
+          model: tool.schema.string().optional().describe("Updated model (maps to --model)"),
+          variant: tool.schema.string().optional().describe("Updated model variant (maps to --variant)"),
+          title: tool.schema.string().optional().describe("Updated session title (maps to --title)"),
+          share: tool.schema.boolean().optional().describe("Updated share flag (maps to --share)"),
+          continue: tool.schema.boolean().optional().describe("Updated continue flag (maps to --continue)"),
+          session: tool.schema.string().optional().describe("Updated session id (maps to --session)"),
+          runFormat: tool.schema.string().optional().describe("Updated run output format (default|json)"),
+          port: tool.schema.number().optional().describe("Updated port (maps to --port)"),
           workdir: tool.schema.string().optional().describe("Updated working directory"),
           attachUrl: tool.schema.string().optional().describe("Updated attach URL (set to empty to clear)"),
           format: tool.schema.string().optional().describe("Optional: output format ('text' or 'json').")
@@ -13316,6 +13699,44 @@ ${content.trim()}
             return errorResult(format, `Job "${args.name}" not found.`);
           }
           const updates = {};
+          const parseFiles = (raw) => {
+            if (raw === undefined)
+              return;
+            if (typeof raw !== "string")
+              return;
+            const items = raw.split(",").map((item) => item.trim()).filter(Boolean);
+            return items.length ? items : undefined;
+          };
+          const currentRun = (() => {
+            try {
+              return normalizeRunSpec(getJobRun(job));
+            } catch {
+              return {};
+            }
+          })();
+          const nextRunCandidate = {
+            ...currentRun,
+            prompt: args.prompt !== undefined ? args.prompt : currentRun.prompt,
+            command: args.command !== undefined ? args.command : currentRun.command,
+            arguments: args.arguments !== undefined ? args.arguments : currentRun.arguments,
+            files: args.files !== undefined ? parseFiles(args.files) : currentRun.files,
+            agent: args.agent !== undefined ? args.agent : currentRun.agent,
+            model: args.model !== undefined ? args.model : currentRun.model,
+            variant: args.variant !== undefined ? args.variant : currentRun.variant,
+            title: args.title !== undefined ? args.title : currentRun.title,
+            share: args.share !== undefined ? args.share : currentRun.share,
+            continue: args.continue !== undefined ? args.continue : currentRun.continue,
+            session: args.session !== undefined ? args.session : currentRun.session,
+            runFormat: args.runFormat !== undefined ? parseRunFormatInput(args.runFormat) : currentRun.runFormat,
+            attachUrl: args.attachUrl !== undefined ? args.attachUrl : currentRun.attachUrl,
+            port: args.port !== undefined ? args.port : currentRun.port
+          };
+          try {
+            updates.run = normalizeRunSpec(nextRunCandidate);
+          } catch (error45) {
+            const msg = error45 instanceof Error ? error45.message : String(error45);
+            return errorResult(format, `Invalid run spec: ${msg}`);
+          }
           if (args.schedule !== undefined) {
             if (!args.schedule.trim()) {
               return errorResult(format, "Schedule cannot be empty.");
@@ -13391,6 +13812,20 @@ ${content.trim()}
         description: "Run a scheduled job immediately",
         args: {
           name: tool.schema.string().describe("The job name or slug"),
+          prompt: tool.schema.string().optional().describe("Override prompt for this run"),
+          command: tool.schema.string().optional().describe("Override command for this run"),
+          arguments: tool.schema.string().optional().describe("Override arguments for command mode"),
+          files: tool.schema.string().optional().describe("Override comma-separated files/dirs to attach"),
+          agent: tool.schema.string().optional().describe("Override agent"),
+          model: tool.schema.string().optional().describe("Override model"),
+          variant: tool.schema.string().optional().describe("Override variant"),
+          title: tool.schema.string().optional().describe("Override title"),
+          share: tool.schema.boolean().optional().describe("Override share flag"),
+          continue: tool.schema.boolean().optional().describe("Override continue flag"),
+          session: tool.schema.string().optional().describe("Override session id"),
+          runFormat: tool.schema.string().optional().describe("Override run output format (default|json)"),
+          port: tool.schema.number().optional().describe("Override port"),
+          attachUrl: tool.schema.string().optional().describe("Override attach URL"),
           format: tool.schema.string().optional().describe("Optional: output format ('text' or 'json').")
         },
         async execute(args) {
@@ -13399,16 +13834,60 @@ ${content.trim()}
           if (!job) {
             return errorResult(format, `Job "${args.name}" not found. Use list_jobs to see available jobs.`);
           }
+          const parseFiles = (raw) => {
+            if (raw === undefined)
+              return;
+            if (typeof raw !== "string")
+              return;
+            const items = raw.split(",").map((item) => item.trim()).filter(Boolean);
+            return items.length ? items : undefined;
+          };
+          const baseRun = (() => {
+            try {
+              return normalizeRunSpec(getJobRun(job));
+            } catch {
+              return {};
+            }
+          })();
+          const overrideCandidate = {
+            ...baseRun,
+            prompt: args.prompt !== undefined ? args.prompt : baseRun.prompt,
+            command: args.command !== undefined ? args.command : baseRun.command,
+            arguments: args.arguments !== undefined ? args.arguments : baseRun.arguments,
+            files: args.files !== undefined ? parseFiles(args.files) : baseRun.files,
+            agent: args.agent !== undefined ? args.agent : baseRun.agent,
+            model: args.model !== undefined ? args.model : baseRun.model,
+            variant: args.variant !== undefined ? args.variant : baseRun.variant,
+            title: args.title !== undefined ? args.title : baseRun.title,
+            share: args.share !== undefined ? args.share : baseRun.share,
+            continue: args.continue !== undefined ? args.continue : baseRun.continue,
+            session: args.session !== undefined ? args.session : baseRun.session,
+            runFormat: args.runFormat !== undefined ? parseRunFormatInput(args.runFormat) : baseRun.runFormat,
+            port: args.port !== undefined ? args.port : baseRun.port,
+            attachUrl: args.attachUrl !== undefined ? args.attachUrl : baseRun.attachUrl
+          };
+          let runOverride;
+          try {
+            runOverride = normalizeRunSpec(overrideCandidate);
+            validateRunSpec(runOverride);
+          } catch (error45) {
+            const msg = error45 instanceof Error ? error45.message : String(error45);
+            return errorResult(format, `Invalid run override: ${msg}`);
+          }
+          const runJob = {
+            ...job,
+            run: runOverride
+          };
           let runResult;
           try {
-            runResult = runJobNow(job);
+            runResult = runJobNow(runJob);
           } catch (error45) {
             const msg = error45 instanceof Error ? error45.message : String(error45);
             return errorResult(format, `Failed to start job "${job.name}": ${msg}`);
           }
           const logs = getJobLogs(job.slug);
-          const attachHint = job.attachUrl ? `
-Attach: opencode attach ${job.attachUrl}` : "";
+          const attachHint = runOverride.attachUrl ? `
+Attach: opencode attach ${runOverride.attachUrl}` : "";
           const logSection = logs ? `
 Latest logs:
 ${logs}` : `
