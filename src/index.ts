@@ -23,6 +23,7 @@ import { fileURLToPath } from "url"
 const OPENCODE_CONFIG = join(homedir(), ".config", "opencode")
 const JOBS_DIR = join(OPENCODE_CONFIG, "jobs")
 const LOGS_DIR = join(OPENCODE_CONFIG, "logs")
+const SCHEDULER_CONFIG = join(OPENCODE_CONFIG, "opencode-scheduler.json")
 
 // Platform detection
 const IS_MAC = platform() === "darwin"
@@ -53,6 +54,16 @@ function slugify(name: string): string {
 // Job type
 
 type OpencodeRunFormat = "default" | "json"
+
+type SchedulerEnvConfig = {
+  preserve?: string[]
+  set?: Record<string, string>
+  preserveOpencodeEnv?: boolean
+}
+
+type SchedulerConfig = {
+  env?: SchedulerEnvConfig
+}
 
 interface JobRunSpec {
   prompt?: string
@@ -1120,10 +1131,37 @@ function buildRunEnvironment(): NodeJS.ProcessEnv {
     return basePolicy
   })()
 
+  const baseEnv: NodeJS.ProcessEnv = { ...process.env }
+  const config = loadSchedulerConfig()
+  const preserveOpencodeEnv = config.env?.preserveOpencodeEnv === true
+  const preserved = new Set(["OPENCODE_PERMISSION", ...(config.env?.preserve ?? [])])
+
+  if (!preserveOpencodeEnv) {
+    for (const key of Object.keys(baseEnv)) {
+      if (!key.startsWith("OPENCODE_")) continue
+      if (key.startsWith("OPENCODE_SCHEDULER_")) continue
+      if (preserved.has(key)) continue
+      delete baseEnv[key]
+    }
+  }
+
   return {
-    ...process.env,
+    ...baseEnv,
+    ...config.env?.set,
     PATH: combinedPath,
     OPENCODE_PERMISSION: JSON.stringify(mergedPolicy),
+  }
+}
+
+function loadSchedulerConfig(): SchedulerConfig {
+  if (!existsSync(SCHEDULER_CONFIG)) return {}
+  try {
+    const raw = readFileSync(SCHEDULER_CONFIG, "utf-8")
+    const parsed = JSON.parse(raw) as unknown
+    if (!isRecord(parsed)) return {}
+    return parsed as SchedulerConfig
+  } catch {
+    return {}
   }
 }
 
