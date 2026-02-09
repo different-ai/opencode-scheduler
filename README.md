@@ -8,6 +8,8 @@ Schedule a daily job at 9am to search Facebook Marketplace for posters under $10
 
 This is an [OpenCode](https://opencode.ai) plugin that uses your OS's native scheduler (launchd on Mac, systemd on Linux) to run prompts reliably—survives reboots, catches up on missed runs.
 
+As of `v1.2.0`, jobs are scoped by `workdir` (so different projects don't collide), and scheduled runs are supervised (no overlap + optional timeout).
+
 ## Install
 
 Add to your `opencode.json`:
@@ -52,13 +54,19 @@ Schedule a job every 6 hours to check if my website is up and alert me on Slack 
 ## How It Works
 
 1. You describe what you want scheduled in natural language
-2. The plugin creates a cron job and installs it in your OS scheduler
-3. At the scheduled time, OpenCode runs your prompt autonomously
-4. Output is logged to `~/.config/opencode/logs/`
+2. The plugin writes a job file (scoped by `workdir`) and installs a timer in your OS scheduler
+3. At the scheduled time, the OS scheduler calls a small supervisor script
+4. The supervisor runs the job, appends logs, and updates job metadata
 
 You can also trigger a job immediately via `run_job`—it runs fire-and-forget and appends to the same log file.
 
 Jobs run from the working directory where you created them, picking up your `opencode.json` and MCP configurations.
+
+### Reliability Guarantees (Scheduled Runs)
+
+- **No overlap**: if the previous run is still active, the next scheduled tick is skipped.
+- **Non-interactive by default**: scheduled runs force `OPENCODE_PERMISSION` to deny "question" prompts, so jobs don't hang waiting for approvals.
+- **Optional timeout**: set `timeoutSeconds` to hard-stop long runs (SIGTERM, then SIGKILL).
 
 ---
 
@@ -100,16 +108,23 @@ Jobs use standard 5-field cron expressions:
 | `run_job` | Execute a job immediately (fire-and-forget) |
 | `job_logs` | View the latest logs from a job |
 
+`schedule_job` and `update_job` accept an optional `timeoutSeconds` (integer seconds). Use `0` (or omit) to disable.
+
 Tools accept an optional `format: "json"` argument to return structured output with `success`, `output`, `shouldContinue`, and `data`.
 
 ### Storage
 
 | What | Where |
 |------|-------|
-| Job configs | `~/.config/opencode/jobs/*.json` |
-| Logs | `~/.config/opencode/logs/*.log` |
-| launchd plists (Mac) | `~/Library/LaunchAgents/com.opencode.job.*.plist` |
-| systemd units (Linux) | `~/.config/systemd/user/opencode-job-*.{service,timer}` |
+| Job configs (scoped) | `~/.config/opencode/scheduler/scopes/<scopeId>/jobs/*.json` |
+| Run records (scoped) | `~/.config/opencode/scheduler/scopes/<scopeId>/runs/*.jsonl` |
+| Locks (scoped) | `~/.config/opencode/scheduler/scopes/<scopeId>/locks/*.json` |
+| Logs (scoped) | `~/.config/opencode/logs/scheduler/<scopeId>/*.log` |
+| Supervisor script | `~/.config/opencode/scheduler/supervisor.pl` |
+| launchd plists (Mac) | `~/Library/LaunchAgents/com.opencode.job.<scopeId>.*.plist` |
+| systemd units (Linux) | `~/.config/systemd/user/opencode-job-<scopeId>-*.{service,timer}` |
+
+Legacy note: older versions stored jobs in `~/.config/opencode/jobs/*.json` and used unscoped unit names. `delete_job` removes both scoped and legacy artifacts.
 
 ### Working Directory
 
@@ -120,6 +135,14 @@ Schedule a daily job at 9am from /path/to/project to run my-task
 ```
 
 By default, jobs use the directory where you created them.
+
+### Scopes
+
+Scopes are derived from the job's `workdir` (normalized absolute path). This isolates job storage, logs, and OS scheduler unit names per project.
+
+- `list_jobs` defaults to the **current scope** (your current working directory).
+- Use `allScopes: true` to list jobs across all scopes.
+- Use `includeLegacy: true` to include pre-`v1.2.0` jobs stored in `~/.config/opencode/jobs`.
 
 ### Attach URL (optional)
 
