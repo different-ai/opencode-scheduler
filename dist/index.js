@@ -12332,13 +12332,17 @@ function tool(input) {
 tool.schema = exports_external;
 // src/index.ts
 import { createWriteStream, existsSync, mkdirSync, readdirSync, readFileSync, writeFileSync, unlinkSync } from "fs";
-import { dirname, join } from "path";
+import { basename, dirname, join, resolve as resolvePath } from "path";
 import { homedir, platform } from "os";
 import { execFileSync, execSync, spawn } from "child_process";
 import { fileURLToPath } from "url";
 var OPENCODE_CONFIG = join(homedir(), ".config", "opencode");
-var JOBS_DIR = join(OPENCODE_CONFIG, "jobs");
+var LEGACY_JOBS_DIR = join(OPENCODE_CONFIG, "jobs");
 var LOGS_DIR = join(OPENCODE_CONFIG, "logs");
+var SCHEDULER_DIR = join(OPENCODE_CONFIG, "scheduler");
+var SCOPES_DIR = join(SCHEDULER_DIR, "scopes");
+var SUPERVISOR_PATH = join(SCHEDULER_DIR, "supervisor.pl");
+var SCHEDULER_CONFIG = join(OPENCODE_CONFIG, "opencode-scheduler.json");
 var IS_MAC = platform() === "darwin";
 var IS_LINUX = platform() === "linux";
 var LAUNCH_AGENTS_DIR = join(homedir(), "Library", "LaunchAgents");
@@ -12351,6 +12355,311 @@ function ensureDir(dir) {
 }
 function slugify(name) {
   return name.toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-|-$/g, "");
+}
+function normalizeWorkdirPath(input) {
+  const trimmed = input.trim();
+  if (!trimmed)
+    return homedir();
+  return resolvePath(trimmed);
+}
+function fnv1a64(input) {
+  let hash2 = 0xcbf29ce484222325n;
+  const prime = 0x100000001b3n;
+  const data = Buffer.from(input, "utf8");
+  for (const byte of data) {
+    hash2 ^= BigInt(byte);
+    hash2 = hash2 * prime & 0xffffffffffffffffn;
+  }
+  return hash2;
+}
+function fnv1a64Hex(input) {
+  return fnv1a64(input).toString(16).padStart(16, "0");
+}
+function deriveScopeId(workdir) {
+  const normalized = normalizeWorkdirPath(workdir);
+  const base = slugify(basename(normalized)) || "workspace";
+  const suffix = fnv1a64Hex(normalized).slice(0, 12);
+  return `${base}-${suffix}`;
+}
+function scopeDir(scopeId) {
+  return join(SCOPES_DIR, scopeId);
+}
+function scopeJobsDir(scopeId) {
+  return join(scopeDir(scopeId), "jobs");
+}
+function scopeLocksDir(scopeId) {
+  return join(scopeDir(scopeId), "locks");
+}
+function scopeRunsDir(scopeId) {
+  return join(scopeDir(scopeId), "runs");
+}
+function scopeLogsDir(scopeId) {
+  return join(LOGS_DIR, "scheduler", scopeId);
+}
+function jobFilePath(scopeId, slug) {
+  return join(scopeJobsDir(scopeId), `${slug}.json`);
+}
+function scopedLogPath(scopeId, slug) {
+  return join(scopeLogsDir(scopeId), `${slug}.log`);
+}
+function currentScopeId() {
+  return deriveScopeId(process.cwd());
+}
+var SUPERVISOR_SCRIPT = `#!/usr/bin/perl
+use strict;
+use warnings;
+use JSON::PP;
+use File::Basename qw(dirname);
+use File::Path qw(make_path);
+use POSIX qw(setsid strftime);
+use Time::HiRes qw(time);
+
+# opencode-scheduler supervisor v1
+
+sub iso_now {
+  my @t = localtime(time());
+  return strftime("%Y-%m-%dT%H:%M:%S%z", @t);
+}
+
+sub read_json {
+  my ($path) = @_;
+  open my $fh, "<", $path or die "Failed to read $path: $!
+";
+  local $/;
+  my $raw = <$fh>;
+  close $fh;
+  my $json = JSON::PP->new->utf8->relaxed;
+  return $json->decode($raw);
+}
+
+sub write_json_atomic {
+  my ($path, $data) = @_;
+  my $tmp = "$path.tmp.$$";
+  my $json = JSON::PP->new->utf8->canonical;
+  open my $fh, ">", $tmp or die "Failed to write $tmp: $!
+";
+  print $fh $json->encode($data);
+  close $fh or die "Failed to close $tmp: $!
+";
+  rename $tmp, $path or die "Failed to rename $tmp -> $path: $!
+";
+}
+
+sub append_jsonl {
+  my ($path, $data) = @_;
+  my $json = JSON::PP->new->utf8->canonical;
+  open my $fh, ">>", $path or die "Failed to append $path: $!
+";
+  print $fh $json->encode($data) . "
+";
+  close $fh;
+}
+
+sub pid_alive {
+  my ($pid) = @_;
+  return 0 if !$pid;
+  return kill 0, $pid;
+}
+
+sub random_id {
+  my $n = int(rand(1_000_000_000));
+  return sprintf("%09d", $n);
+}
+
+my $job_path = shift @ARGV;
+if (!$job_path) { die "usage: supervisor.pl <job.json>
+"; }
+
+my $job = read_json($job_path);
+my $scope_id = $job->{scopeId} || "";
+my $slug = $job->{slug} || "";
+if (!$scope_id || !$slug) { die "job missing scopeId/slug
+"; }
+
+my $home = $ENV{HOME} || "";
+if (!$home) { die "HOME is not set
+"; }
+
+my $config_root = "$home/.config/opencode";
+my $scheduler_root = "$config_root/scheduler/scopes/$scope_id";
+my $locks_dir = "$scheduler_root/locks";
+my $runs_dir = "$scheduler_root/runs";
+my $logs_dir = "$config_root/logs/scheduler/$scope_id";
+
+make_path($locks_dir);
+make_path($runs_dir);
+make_path($logs_dir);
+
+my $log_path = "$logs_dir/$slug.log";
+open STDOUT, ">>", $log_path or die "Failed to open log $log_path: $!
+";
+open STDERR, ">&STDOUT" or die "Failed to dup stderr: $!
+";
+select STDOUT; $| = 1;
+select STDERR; $| = 1;
+
+my $lock_path = "$locks_dir/$slug.json";
+if (-e $lock_path) {
+  my $lock = eval { read_json($lock_path) };
+  my $pid = ($lock && ref($lock) eq 'HASH') ? ($lock->{pid} || 0) : 0;
+  if (pid_alive($pid)) {
+    my $now = iso_now();
+    print "
+=== Scheduled run skipped (already running pid=$pid) $now ===
+";
+    exit 0;
+  }
+  unlink $lock_path;
+}
+
+my $run_id = time() . "-" . random_id();
+my $started_at = iso_now();
+my $t0 = time();
+
+write_json_atomic($lock_path, { pid => $$, startedAt => $started_at, runId => $run_id });
+
+# Update job metadata: running
+$job->{lastRunAt} = $started_at;
+$job->{lastRunSource} = "scheduled";
+$job->{lastRunStatus} = "running";
+delete $job->{lastRunExitCode};
+delete $job->{lastRunError};
+$job->{updatedAt} = $started_at;
+write_json_atomic($job_path, $job);
+
+# Force non-interactive scheduled runs
+my $perm = { question => "deny" };
+if ($ENV{OPENCODE_PERMISSION}) {
+  my $existing = eval { JSON::PP->new->decode($ENV{OPENCODE_PERMISSION}) };
+  if ($existing && ref($existing) eq 'HASH') {
+    $perm = { %$existing, %$perm };
+  }
+}
+$ENV{OPENCODE_PERMISSION} = JSON::PP->new->canonical->encode($perm);
+$ENV{OPENCODE_SCHEDULER_RUN_ID} = $run_id;
+
+print "
+=== Scheduled run $started_at runId=$run_id ===
+";
+
+my $inv = $job->{invocation};
+if (!$inv || ref($inv) ne 'HASH' || !$inv->{command} || ref($inv->{args}) ne 'ARRAY') {
+  my $now = iso_now();
+  print "
+=== Supervisor error $now: job missing invocation.command/args ===
+";
+  $job->{lastRunStatus} = "failed";
+  $job->{lastRunError} = "job missing invocation";
+  $job->{updatedAt} = $now;
+  write_json_atomic($job_path, $job);
+  unlink $lock_path;
+  exit 1;
+}
+
+my $command = $inv->{command};
+my @args = @{ $inv->{args} };
+
+my $workdir = $job->{workdir} || $home;
+
+my $timeout = $job->{timeoutSeconds};
+$timeout = undef if defined($timeout) && $timeout !~ /^\\d+$/;
+
+my $timed_out = 0;
+my $child_pid = fork();
+if (!defined $child_pid) {
+  my $now = iso_now();
+  print "
+=== Supervisor error $now: fork failed: $! ===
+";
+  $job->{lastRunStatus} = "failed";
+  $job->{lastRunError} = "fork failed";
+  $job->{updatedAt} = $now;
+  write_json_atomic($job_path, $job);
+  unlink $lock_path;
+  exit 1;
+}
+
+if ($child_pid == 0) {
+  chdir $workdir or die "Failed to chdir to $workdir: $!
+";
+  eval { setsid(); };
+  exec { $command } $command, @args;
+  die "Failed to exec $command: $!
+";
+}
+
+if (defined($timeout) && $timeout > 0) {
+  local $SIG{ALRM} = sub {
+    $timed_out = 1;
+    my $now = iso_now();
+    print "
+=== Timeout after $timeout seconds $now; sending SIGTERM ===
+";
+    kill 'TERM', -$child_pid;
+    sleep 5;
+    print "
+=== Forcing SIGKILL $now ===
+";
+    kill 'KILL', -$child_pid;
+  };
+  alarm($timeout);
+}
+
+my $waited = waitpid($child_pid, 0);
+my $status = $?;
+alarm(0);
+
+my $finished_at = iso_now();
+my $duration_ms = int((time() - $t0) * 1000);
+my $exit_code = ($status >> 8);
+if ($timed_out) {
+  $exit_code = 124;
+}
+
+my $final_status = "failed";
+my $final_error = undef;
+if ($timed_out) {
+  $final_status = "failed";
+  $final_error = "timeout";
+} elsif ($waited != $child_pid) {
+  $final_status = "failed";
+  $final_error = "waitpid failed";
+} elsif ($status == 0) {
+  $final_status = "success";
+} else {
+  $final_status = "failed";
+  $final_error = "exit code $exit_code";
+}
+
+$job->{lastRunStatus} = $final_status;
+$job->{lastRunExitCode} = $exit_code;
+$job->{lastRunError} = $final_error if defined $final_error;
+$job->{updatedAt} = $finished_at;
+write_json_atomic($job_path, $job);
+
+append_jsonl("$runs_dir/$slug.jsonl", {
+  runId => $run_id,
+  scopeId => $scope_id,
+  slug => $slug,
+  startedAt => $started_at,
+  finishedAt => $finished_at,
+  durationMs => $duration_ms,
+  status => $final_status,
+  exitCode => $exit_code,
+  error => $final_error,
+  pid => $child_pid,
+  logPath => $log_path,
+});
+
+unlink $lock_path;
+print "
+=== Finished $finished_at status=$final_status exitCode=$exit_code durationMs=$duration_ms ===
+";
+exit($exit_code);
+`;
+function ensureSupervisorScript() {
+  ensureDir(SCHEDULER_DIR);
+  writeFileSync(SUPERVISOR_PATH, SUPERVISOR_SCRIPT);
 }
 function normalizeFormat(format) {
   return format === "json" ? "json" : "text";
@@ -12686,8 +12995,10 @@ function cronToSystemdCalendars(cron) {
   return calendars;
 }
 function createLaunchdPlist(job) {
-  const label = `${LAUNCHD_PREFIX}.${job.slug}`;
-  const logPath = join(LOGS_DIR, `${job.slug}.log`);
+  const scopeId = job.scopeId || deriveScopeId(job.workdir || homedir());
+  const label = `${LAUNCHD_PREFIX}.${scopeId}.${job.slug}`;
+  const logFilePath = scopedLogPath(scopeId, job.slug);
+  const jobPath = jobFilePath(scopeId, job.slug);
   const calendars = cronToLaunchdCalendars(job.schedule);
   const calendarXml = calendars.length === 1 ? `  <dict>
 ${renderLaunchdCalendar(calendars[0])}
@@ -12697,12 +13008,10 @@ ${renderLaunchdCalendar(calendar)}
   </dict>`).join(`
 `)}
   </array>`;
-  const invocation = buildOpencodeArgs(job);
-  const programArguments = invocation.args.map((arg) => `    <string>${escapePlistString(arg)}</string>`).join(`
-`);
   const programArgumentsXml = [
-    `    <string>${escapePlistString(invocation.command)}</string>`,
-    programArguments
+    `    <string>${escapePlistString("/usr/bin/perl")}</string>`,
+    `    <string>${escapePlistString(SUPERVISOR_PATH)}</string>`,
+    `    <string>${escapePlistString(jobPath)}</string>`
   ].join(`
 `);
   const workdir = job.workdir || homedir();
@@ -12732,10 +13041,10 @@ ${programArgumentsXml}
 ${calendarXml}
   
   <key>StandardOutPath</key>
-  <string>${logPath}</string>
+  <string>${logFilePath}</string>
   
   <key>StandardErrorPath</key>
-  <string>${logPath}</string>
+  <string>${logFilePath}</string>
   
   <key>RunAtLoad</key>
   <false/>
@@ -12745,31 +13054,49 @@ ${calendarXml}
 function installLaunchdJob(job) {
   ensureDir(LAUNCH_AGENTS_DIR);
   ensureDir(LOGS_DIR);
-  const label = `${LAUNCHD_PREFIX}.${job.slug}`;
+  const scopeId = job.scopeId || deriveScopeId(job.workdir || homedir());
+  ensureDir(scopeLogsDir(scopeId));
+  ensureSupervisorScript();
+  const legacyLabel = `${LAUNCHD_PREFIX}.${job.slug}`;
+  const legacyPlistPath = join(LAUNCH_AGENTS_DIR, `${legacyLabel}.plist`);
+  const label = `${LAUNCHD_PREFIX}.${scopeId}.${job.slug}`;
   const plistPath = join(LAUNCH_AGENTS_DIR, `${label}.plist`);
   try {
     execSync(`launchctl unload "${plistPath}" 2>/dev/null`, { stdio: "ignore" });
   } catch {}
+  if (existsSync(legacyPlistPath)) {
+    try {
+      execSync(`launchctl unload "${legacyPlistPath}" 2>/dev/null`, { stdio: "ignore" });
+    } catch {}
+  }
   const plist = createLaunchdPlist(job);
   writeFileSync(plistPath, plist);
   execSync(`launchctl load "${plistPath}"`);
 }
-function uninstallLaunchdJob(slug) {
-  const label = `${LAUNCHD_PREFIX}.${slug}`;
-  const plistPath = join(LAUNCH_AGENTS_DIR, `${label}.plist`);
-  if (existsSync(plistPath)) {
+function uninstallLaunchdJob(job) {
+  const scopeId = job.scopeId || deriveScopeId(job.workdir || homedir());
+  const scopedLabel = `${LAUNCHD_PREFIX}.${scopeId}.${job.slug}`;
+  const scopedPlistPath = join(LAUNCH_AGENTS_DIR, `${scopedLabel}.plist`);
+  const legacyLabel = `${LAUNCHD_PREFIX}.${job.slug}`;
+  const legacyPlistPath = join(LAUNCH_AGENTS_DIR, `${legacyLabel}.plist`);
+  for (const plistPath of [scopedPlistPath, legacyPlistPath]) {
+    if (!existsSync(plistPath))
+      continue;
     try {
       execSync(`launchctl unload "${plistPath}"`, { stdio: "ignore" });
     } catch {}
-    unlinkSync(plistPath);
+    try {
+      unlinkSync(plistPath);
+    } catch {}
   }
 }
 function createSystemdService(job) {
-  const logPath = join(LOGS_DIR, `${job.slug}.log`);
+  const scopeId = job.scopeId || deriveScopeId(job.workdir || homedir());
+  const logFilePath = scopedLogPath(scopeId, job.slug);
+  const jobPath = jobFilePath(scopeId, job.slug);
   const workdir = job.workdir || homedir();
   const enhancedPath = getEnhancedPath();
-  const invocation = buildOpencodeArgs(job);
-  const escapedArgs = invocation.args.map((arg) => `"${escapeSystemdArg(arg)}"`).join(" ");
+  const execStart = ["/usr/bin/perl", SUPERVISOR_PATH, jobPath].map((arg) => `"${escapeSystemdArg(arg)}"`).join(" ");
   return `[Unit]
 Description=OpenCode Job: ${job.name}
 
@@ -12777,9 +13104,9 @@ Description=OpenCode Job: ${job.name}
 Type=oneshot
 WorkingDirectory=${workdir}
 Environment="PATH=${enhancedPath}"
-ExecStart=${invocation.command} ${escapedArgs}
-StandardOutput=append:${logPath}
-StandardError=append:${logPath}
+ExecStart=${execStart}
+StandardOutput=append:${logFilePath}
+StandardError=append:${logFilePath}
 
 [Install]
 WantedBy=default.target
@@ -12803,25 +13130,42 @@ WantedBy=timers.target
 function installSystemdJob(job) {
   ensureDir(SYSTEMD_USER_DIR);
   ensureDir(LOGS_DIR);
-  const servicePath = join(SYSTEMD_USER_DIR, `opencode-job-${job.slug}.service`);
-  const timerPath = join(SYSTEMD_USER_DIR, `opencode-job-${job.slug}.timer`);
+  const scopeId = job.scopeId || deriveScopeId(job.workdir || homedir());
+  ensureDir(scopeLogsDir(scopeId));
+  ensureSupervisorScript();
+  const servicePath = join(SYSTEMD_USER_DIR, `opencode-job-${scopeId}-${job.slug}.service`);
+  const timerPath = join(SYSTEMD_USER_DIR, `opencode-job-${scopeId}-${job.slug}.timer`);
+  try {
+    execSync(`systemctl --user stop opencode-job-${job.slug}.timer`, { stdio: "ignore" });
+    execSync(`systemctl --user disable opencode-job-${job.slug}.timer`, { stdio: "ignore" });
+  } catch {}
   writeFileSync(servicePath, createSystemdService(job));
   writeFileSync(timerPath, createSystemdTimer(job));
   execSync("systemctl --user daemon-reload");
-  execSync(`systemctl --user enable opencode-job-${job.slug}.timer`);
-  execSync(`systemctl --user start opencode-job-${job.slug}.timer`);
+  execSync(`systemctl --user enable opencode-job-${scopeId}-${job.slug}.timer`);
+  execSync(`systemctl --user start opencode-job-${scopeId}-${job.slug}.timer`);
 }
-function uninstallSystemdJob(slug) {
-  try {
-    execSync(`systemctl --user stop opencode-job-${slug}.timer`, { stdio: "ignore" });
-    execSync(`systemctl --user disable opencode-job-${slug}.timer`, { stdio: "ignore" });
-  } catch {}
-  const servicePath = join(SYSTEMD_USER_DIR, `opencode-job-${slug}.service`);
-  const timerPath = join(SYSTEMD_USER_DIR, `opencode-job-${slug}.timer`);
-  if (existsSync(servicePath))
-    unlinkSync(servicePath);
-  if (existsSync(timerPath))
-    unlinkSync(timerPath);
+function uninstallSystemdJob(job) {
+  const scopeId = job.scopeId || deriveScopeId(job.workdir || homedir());
+  const scopedTimerUnit = `opencode-job-${scopeId}-${job.slug}.timer`;
+  const legacyTimerUnit = `opencode-job-${job.slug}.timer`;
+  for (const timerUnit of [scopedTimerUnit, legacyTimerUnit]) {
+    try {
+      execSync(`systemctl --user stop ${timerUnit}`, { stdio: "ignore" });
+      execSync(`systemctl --user disable ${timerUnit}`, { stdio: "ignore" });
+    } catch {}
+  }
+  const scopedServicePath = join(SYSTEMD_USER_DIR, `opencode-job-${scopeId}-${job.slug}.service`);
+  const scopedTimerPath = join(SYSTEMD_USER_DIR, `opencode-job-${scopeId}-${job.slug}.timer`);
+  const legacyServicePath = join(SYSTEMD_USER_DIR, `opencode-job-${job.slug}.service`);
+  const legacyTimerPath = join(SYSTEMD_USER_DIR, `opencode-job-${job.slug}.timer`);
+  for (const p of [scopedServicePath, scopedTimerPath, legacyServicePath, legacyTimerPath]) {
+    if (existsSync(p)) {
+      try {
+        unlinkSync(p);
+      } catch {}
+    }
+  }
   try {
     execSync("systemctl --user daemon-reload", { stdio: "ignore" });
   } catch {}
@@ -12835,16 +13179,24 @@ function installJob(job) {
     throw new Error(`Unsupported platform: ${platform()}. Only macOS and Linux are supported.`);
   }
 }
-function uninstallJob(slug) {
+function uninstallJob(job) {
   if (IS_MAC) {
-    uninstallLaunchdJob(slug);
+    uninstallLaunchdJob(job);
   } else if (IS_LINUX) {
-    uninstallSystemdJob(slug);
+    uninstallSystemdJob(job);
   }
 }
-function loadJob(slug) {
-  ensureDir(JOBS_DIR);
-  const path = join(JOBS_DIR, `${slug}.json`);
+function ensureScopeStorage(scopeId) {
+  ensureDir(SCHEDULER_DIR);
+  ensureDir(SCOPES_DIR);
+  ensureDir(scopeJobsDir(scopeId));
+  ensureDir(scopeLocksDir(scopeId));
+  ensureDir(scopeRunsDir(scopeId));
+  ensureDir(scopeLogsDir(scopeId));
+}
+function loadScopedJob(scopeId, slug) {
+  ensureScopeStorage(scopeId);
+  const path = jobFilePath(scopeId, slug);
   if (!existsSync(path))
     return null;
   try {
@@ -12853,24 +13205,71 @@ function loadJob(slug) {
     return null;
   }
 }
-function loadAllJobs() {
-  ensureDir(JOBS_DIR);
-  const files = readdirSync(JOBS_DIR).filter((f) => f.endsWith(".json"));
+function loadAllScopedJobs(scopeId) {
+  ensureScopeStorage(scopeId);
+  const files = readdirSync(scopeJobsDir(scopeId)).filter((f) => f.endsWith(".json"));
   return files.map((f) => {
     try {
-      return normalizeJob(JSON.parse(readFileSync(join(JOBS_DIR, f), "utf-8")));
+      return normalizeJob(JSON.parse(readFileSync(join(scopeJobsDir(scopeId), f), "utf-8")));
+    } catch {
+      return null;
+    }
+  }).filter(Boolean);
+}
+function listScopeIds() {
+  ensureDir(SCOPES_DIR);
+  try {
+    return readdirSync(SCOPES_DIR).filter((name) => {
+      try {
+        return existsSync(scopeDir(name));
+      } catch {
+        return false;
+      }
+    }).sort();
+  } catch {
+    return [];
+  }
+}
+function loadAllJobsAcrossScopes() {
+  const scopeIds = listScopeIds();
+  const out = [];
+  for (const scopeId of scopeIds) {
+    out.push(...loadAllScopedJobs(scopeId));
+  }
+  return out;
+}
+function loadLegacyJob(slug) {
+  ensureDir(LEGACY_JOBS_DIR);
+  const path = join(LEGACY_JOBS_DIR, `${slug}.json`);
+  if (!existsSync(path))
+    return null;
+  try {
+    return normalizeJob(JSON.parse(readFileSync(path, "utf-8")));
+  } catch {
+    return null;
+  }
+}
+function loadAllLegacyJobs() {
+  ensureDir(LEGACY_JOBS_DIR);
+  const files = readdirSync(LEGACY_JOBS_DIR).filter((f) => f.endsWith(".json"));
+  return files.map((f) => {
+    try {
+      return normalizeJob(JSON.parse(readFileSync(join(LEGACY_JOBS_DIR, f), "utf-8")));
     } catch {
       return null;
     }
   }).filter(Boolean);
 }
 function saveJob(job) {
-  ensureDir(JOBS_DIR);
-  const path = join(JOBS_DIR, `${job.slug}.json`);
-  writeFileSync(path, JSON.stringify(sanitizeJob(job), null, 2));
+  const scopeId = job.scopeId || deriveScopeId(job.workdir || homedir());
+  const normalizedJob = { ...job, scopeId };
+  ensureScopeStorage(scopeId);
+  const path = jobFilePath(scopeId, normalizedJob.slug);
+  writeFileSync(path, JSON.stringify(sanitizeJob(normalizedJob), null, 2));
 }
-function deleteJobFile(slug) {
-  const path = join(JOBS_DIR, `${slug}.json`);
+function deleteJobFile(job) {
+  const scopeId = job.scopeId || deriveScopeId(job.workdir || homedir());
+  const path = jobFilePath(scopeId, job.slug);
   if (existsSync(path)) {
     unlinkSync(path);
   }
@@ -13010,6 +13409,40 @@ function getJobRun(job) {
 }
 function sanitizeJob(job) {
   const sanitized = { ...job };
+  if (typeof sanitized.workdir === "string") {
+    const trimmed = sanitized.workdir.trim();
+    sanitized.workdir = trimmed ? trimmed : undefined;
+  }
+  if (typeof sanitized.scopeId === "string") {
+    const trimmed = sanitized.scopeId.trim();
+    sanitized.scopeId = trimmed ? trimmed : undefined;
+  }
+  if (!sanitized.scopeId) {
+    sanitized.scopeId = deriveScopeId(sanitized.workdir || homedir());
+  }
+  if (sanitized.timeoutSeconds !== undefined) {
+    const n = sanitized.timeoutSeconds;
+    if (typeof n !== "number" || !Number.isFinite(n) || n < 0 || Math.floor(n) !== n) {
+      throw new Error("timeoutSeconds must be a non-negative integer");
+    }
+  }
+  if (sanitized.invocation !== undefined) {
+    const inv = sanitized.invocation;
+    if (!inv || typeof inv !== "object") {
+      throw new Error("invocation must be an object");
+    }
+    const rec = inv;
+    if (typeof rec.command !== "string" || !rec.command.trim()) {
+      throw new Error("invocation.command must be a non-empty string");
+    }
+    if (!Array.isArray(rec.args)) {
+      throw new Error("invocation.args must be an array");
+    }
+    sanitized.invocation = {
+      command: rec.command,
+      args: rec.args.map((v) => String(v))
+    };
+  }
   if (sanitized.run) {
     const normalized = normalizeRunSpec(sanitized.run);
     validateRunSpec(normalized);
@@ -13023,6 +13456,18 @@ function sanitizeJob(job) {
     sanitized.prompt = trimmed ? trimmed : undefined;
   }
   return sanitized;
+}
+function normalizeJobInvocation(raw) {
+  if (!isRecord(raw))
+    return;
+  if (typeof raw.command !== "string")
+    return;
+  if (!Array.isArray(raw.args))
+    return;
+  const command = raw.command.trim();
+  if (!command)
+    return;
+  return { command, args: raw.args.map((v) => String(v)) };
 }
 function normalizeJobRun(raw) {
   if (!isRecord(raw))
@@ -13068,11 +13513,13 @@ function normalizeJob(raw) {
     return null;
   }
   const job = {
+    scopeId: typeof raw.scopeId === "string" ? raw.scopeId : undefined,
     slug: raw.slug,
     name: raw.name,
     schedule: raw.schedule,
     source: typeof raw.source === "string" ? raw.source : undefined,
     workdir: typeof raw.workdir === "string" ? raw.workdir : undefined,
+    timeoutSeconds: typeof raw.timeoutSeconds === "number" ? raw.timeoutSeconds : undefined,
     createdAt: typeof raw.createdAt === "string" ? raw.createdAt : new Date().toISOString(),
     updatedAt: typeof raw.updatedAt === "string" ? raw.updatedAt : undefined,
     lastRunAt: typeof raw.lastRunAt === "string" ? raw.lastRunAt : undefined,
@@ -13088,31 +13535,47 @@ function normalizeJob(raw) {
   const run = normalizeJobRun(raw.run);
   if (run)
     job.run = run;
+  const inv = normalizeJobInvocation(raw.invocation);
+  if (inv)
+    job.invocation = inv;
   return sanitizeJob(job);
 }
-function findJobByName(name) {
+function findJobByName(name, options) {
+  const scopeId = options?.scopeId ?? currentScopeId();
   const slug = slugify(name);
-  let job = loadJob(slug) || loadJob(name);
+  let job = loadScopedJob(scopeId, slug) || loadScopedJob(scopeId, name);
   if (!job) {
-    const allJobs = loadAllJobs();
+    const allJobs = loadAllScopedJobs(scopeId);
     job = allJobs.find((j) => j.slug === name || j.slug.endsWith(`-${slug}`) || j.name.toLowerCase() === name.toLowerCase() || j.name.toLowerCase().includes(name.toLowerCase())) || null;
+  }
+  if (!job && options?.allScopes) {
+    const allJobs = loadAllJobsAcrossScopes();
+    job = allJobs.find((j) => j.slug === name || j.slug.endsWith(`-${slug}`) || j.name.toLowerCase() === name.toLowerCase() || j.name.toLowerCase().includes(name.toLowerCase())) || null;
+  }
+  if (!job && options?.includeLegacy) {
+    job = loadLegacyJob(slug) || loadLegacyJob(name);
+    if (!job) {
+      const allJobs = loadAllLegacyJobs();
+      job = allJobs.find((j) => j.slug === name || j.slug.endsWith(`-${slug}`) || j.name.toLowerCase() === name.toLowerCase() || j.name.toLowerCase().includes(name.toLowerCase())) || null;
+    }
   }
   return job;
 }
-function updateJobRecord(slug, updates) {
-  const job = loadJob(slug);
-  if (!job)
-    return null;
+function updateJobRecord(job, updates) {
+  const scopeId = job.scopeId || deriveScopeId(job.workdir || homedir());
+  const latest = loadScopedJob(scopeId, job.slug) || job;
   const updated = {
-    ...job,
+    ...latest,
     ...updates,
+    scopeId,
     updatedAt: new Date().toISOString()
   };
   saveJob(updated);
   return updated;
 }
-function getLogPath(slug) {
-  return join(LOGS_DIR, `${slug}.log`);
+function getLogPath(job) {
+  const scopeId = job.scopeId || deriveScopeId(job.workdir || homedir());
+  return scopedLogPath(scopeId, job.slug);
 }
 function buildOpencodeArgs(job) {
   const command = findOpencode();
@@ -13176,11 +13639,40 @@ function buildRunEnvironment() {
     } catch {}
     return basePolicy;
   })();
+  const baseEnv = { ...process.env };
+  const config2 = loadSchedulerConfig();
+  const preserveOpencodeEnv = config2.env?.preserveOpencodeEnv === true;
+  const preserved = new Set(["OPENCODE_PERMISSION", ...config2.env?.preserve ?? []]);
+  if (!preserveOpencodeEnv) {
+    for (const key of Object.keys(baseEnv)) {
+      if (!key.startsWith("OPENCODE_"))
+        continue;
+      if (key.startsWith("OPENCODE_SCHEDULER_"))
+        continue;
+      if (preserved.has(key))
+        continue;
+      delete baseEnv[key];
+    }
+  }
   return {
-    ...process.env,
+    ...baseEnv,
+    ...config2.env?.set,
     PATH: combinedPath,
     OPENCODE_PERMISSION: JSON.stringify(mergedPolicy)
   };
+}
+function loadSchedulerConfig() {
+  if (!existsSync(SCHEDULER_CONFIG))
+    return {};
+  try {
+    const raw = readFileSync(SCHEDULER_CONFIG, "utf-8");
+    const parsed = JSON.parse(raw);
+    if (!isRecord(parsed))
+      return {};
+    return parsed;
+  } catch {
+    return {};
+  }
 }
 function getOpencodeVersion(opencodePath) {
   try {
@@ -13192,8 +13684,9 @@ function getOpencodeVersion(opencodePath) {
 }
 function runJobNow(job) {
   ensureDir(LOGS_DIR);
+  ensureDir(scopeLogsDir(job.scopeId || deriveScopeId(job.workdir || homedir())));
   const startedAt = new Date().toISOString();
-  const logPath = getLogPath(job.slug);
+  const logPath = getLogPath(job);
   const logStream = createWriteStream(logPath, { flags: "a" });
   const workdir = job.workdir || homedir();
   logStream.write(`
@@ -13214,14 +13707,14 @@ function runJobNow(job) {
 ${message}
 `);
     logStream.end();
-    updateJobRecord(job.slug, {
+    updateJobRecord(job, {
       lastRunStatus: "failed",
       lastRunExitCode: undefined,
       lastRunError: message
     });
     throw error45;
   }
-  const runningJob = updateJobRecord(job.slug, {
+  const runningJob = updateJobRecord(job, {
     lastRunAt: startedAt,
     lastRunSource: "manual",
     lastRunStatus: "running",
@@ -13238,7 +13731,7 @@ ${message}
 ${error45.message}
 `);
     logStream.end();
-    updateJobRecord(job.slug, {
+    updateJobRecord(job, {
       lastRunStatus: "failed",
       lastRunExitCode: undefined,
       lastRunError: error45.message
@@ -13250,7 +13743,7 @@ ${error45.message}
 === Run complete (${exitCode ?? "unknown"}) ${new Date().toISOString()} ===
 `);
     logStream.end();
-    updateJobRecord(job.slug, {
+    updateJobRecord(job, {
       lastRunStatus: exitCode === 0 ? "success" : "failed",
       lastRunExitCode: exitCode,
       lastRunError: exitCode === 0 ? undefined : `Exit code ${exitCode ?? "unknown"}`
@@ -13371,8 +13864,8 @@ function formatJobDetails(job) {
   return lines.join(`
 `);
 }
-function getJobLogs(slug, options) {
-  const logPath = getLogPath(slug);
+function getJobLogs(job, options) {
+  const logPath = getLogPath(job);
   if (!existsSync(logPath))
     return null;
   const maxChars = options?.maxChars ?? 5000;
@@ -13423,13 +13916,19 @@ var SchedulerPlugin = async () => {
           source: tool.schema.string().optional().describe("Optional: source app (e.g. 'marketplace') - used for filtering"),
           workdir: tool.schema.string().optional().describe("Optional: working directory to run from (for MCP config). Defaults to current directory."),
           attachUrl: tool.schema.string().optional().describe("Optional: attach URL for opencode run (e.g. http://localhost:4096)."),
+          timeoutSeconds: tool.schema.number().optional().describe("Optional: max runtime in seconds (0 disables)."),
           format: tool.schema.string().optional().describe("Optional: output format ('text' or 'json').")
         },
         async execute(args) {
           const format = normalizeFormat(args.format);
           const slug = args.source ? `${args.source}-${slugify(args.name)}` : slugify(args.name);
-          if (loadJob(slug)) {
-            return errorResult(format, `Job "${slug}" already exists. Delete it first or use a different name.`);
+          const workdir = normalizeWorkdirPath(args.workdir || process.cwd());
+          const scopeId = deriveScopeId(workdir);
+          if (loadScopedJob(scopeId, slug)) {
+            return errorResult(format, `Job "${slug}" already exists in this workspace scope (${scopeId}). Delete it first or use a different name.`);
+          }
+          if (loadLegacyJob(slug)) {
+            return errorResult(format, `Job "${slug}" already exists (legacy scheduler storage). Delete it first or use a different name.`);
           }
           const parseFiles = (raw) => {
             if (raw === undefined)
@@ -13481,8 +13980,8 @@ var SchedulerPlugin = async () => {
             const msg = error45 instanceof Error ? error45.message : String(error45);
             return errorResult(format, `Invalid cron schedule: ${msg}`);
           }
-          const workdir = args.workdir || process.cwd();
           const job = {
+            scopeId,
             slug,
             name: args.name,
             schedule: args.schedule,
@@ -13491,8 +13990,15 @@ var SchedulerPlugin = async () => {
             source: args.source,
             workdir,
             attachUrl,
+            timeoutSeconds: args.timeoutSeconds,
             createdAt: new Date().toISOString()
           };
+          try {
+            job.invocation = buildOpencodeArgs(job);
+          } catch (error45) {
+            const msg = error45 instanceof Error ? error45.message : String(error45);
+            return errorResult(format, `Failed to build invocation: ${msg}`);
+          }
           try {
             saveJob(job);
             installJob(job);
@@ -13514,7 +14020,7 @@ Commands:
 - "show my jobs" - list all
 - "delete job ${args.name}" - remove`, { job });
           } catch (error45) {
-            deleteJobFile(slug);
+            deleteJobFile(job);
             const msg = error45 instanceof Error ? error45.message : String(error45);
             return errorResult(format, `Failed to schedule job: ${msg}`);
           }
@@ -13524,11 +14030,18 @@ Commands:
         description: "List all scheduled jobs. Optionally filter by source app.",
         args: {
           source: tool.schema.string().optional().describe("Filter by source app (e.g. 'marketplace')"),
+          allScopes: tool.schema.boolean().optional().describe("List jobs across all scopes."),
+          includeLegacy: tool.schema.boolean().optional().describe("Include legacy jobs from ~/.config/opencode/jobs"),
+          scopeRoot: tool.schema.string().optional().describe("Optional: scope root directory (defaults to current directory)."),
           format: tool.schema.string().optional().describe("Optional: output format ('text' or 'json').")
         },
         async execute(args) {
           const format = normalizeFormat(args.format);
-          let jobs = loadAllJobs();
+          const scopeId = args.allScopes ? undefined : deriveScopeId(normalizeWorkdirPath(args.scopeRoot || process.cwd()));
+          let jobs = args.allScopes ? loadAllJobsAcrossScopes() : loadAllScopedJobs(scopeId);
+          if (args.includeLegacy) {
+            jobs = [...jobs, ...loadAllLegacyJobs()];
+          }
           if (args.source) {
             jobs = jobs.filter((j) => j.source === args.source || j.slug.startsWith(`${args.source}-`));
           }
@@ -13688,6 +14201,7 @@ ${content.trim()}
           session: tool.schema.string().optional().describe("Updated session id (maps to --session)"),
           runFormat: tool.schema.string().optional().describe("Updated run output format (default|json)"),
           port: tool.schema.number().optional().describe("Updated port (maps to --port)"),
+          timeoutSeconds: tool.schema.number().optional().describe("Updated timeout in seconds (0 disables)"),
           workdir: tool.schema.string().optional().describe("Updated working directory"),
           attachUrl: tool.schema.string().optional().describe("Updated attach URL (set to empty to clear)"),
           format: tool.schema.string().optional().describe("Optional: output format ('text' or 'json').")
@@ -13759,7 +14273,9 @@ ${content.trim()}
             if (!args.workdir.trim()) {
               return errorResult(format, "Working directory cannot be empty.");
             }
-            updates.workdir = args.workdir;
+            const normalizedWorkdir = normalizeWorkdirPath(args.workdir);
+            updates.workdir = normalizedWorkdir;
+            updates.scopeId = deriveScopeId(normalizedWorkdir);
           }
           if (args.attachUrl !== undefined) {
             try {
@@ -13768,6 +14284,9 @@ ${content.trim()}
               const msg = error45 instanceof Error ? error45.message : String(error45);
               return errorResult(format, msg);
             }
+          }
+          if (args.timeoutSeconds !== undefined) {
+            updates.timeoutSeconds = args.timeoutSeconds;
           }
           if (Object.keys(updates).length === 0) {
             return errorResult(format, "No updates provided.");
@@ -13778,13 +14297,33 @@ ${content.trim()}
             updatedAt: new Date().toISOString()
           };
           try {
+            updatedJob.invocation = buildOpencodeArgs(updatedJob);
+          } catch (error45) {
+            const msg = error45 instanceof Error ? error45.message : String(error45);
+            return errorResult(format, `Failed to build invocation: ${msg}`);
+          }
+          try {
+            const oldScopeId = job.scopeId || deriveScopeId(job.workdir || homedir());
+            const nextScopeId = updatedJob.scopeId || deriveScopeId(updatedJob.workdir || homedir());
+            const scopeChanged = oldScopeId !== nextScopeId;
+            if (scopeChanged) {
+              uninstallJob(job);
+            }
             saveJob(updatedJob);
             installJob(updatedJob);
+            if (scopeChanged) {
+              const oldPath = jobFilePath(oldScopeId, job.slug);
+              if (existsSync(oldPath)) {
+                try {
+                  unlinkSync(oldPath);
+                } catch {}
+              }
+            }
             return okResult(format, `Updated job "${updatedJob.name}"`, { job: updatedJob });
           } catch (error45) {
             const msg = error45 instanceof Error ? error45.message : String(error45);
-            saveJob(job);
             try {
+              saveJob(job);
               installJob(job);
             } catch {}
             return errorResult(format, `Failed to update job: ${msg}`);
@@ -13803,8 +14342,14 @@ ${content.trim()}
           if (!job) {
             return errorResult(format, `Job "${args.name}" not found.`);
           }
-          uninstallJob(job.slug);
-          deleteJobFile(job.slug);
+          uninstallJob(job);
+          deleteJobFile(job);
+          const legacyPath = join(LEGACY_JOBS_DIR, `${job.slug}.json`);
+          if (existsSync(legacyPath)) {
+            try {
+              unlinkSync(legacyPath);
+            } catch {}
+          }
           return okResult(format, `Deleted job "${job.name}"`, { job });
         }
       }),
@@ -13885,7 +14430,7 @@ ${content.trim()}
             const msg = error45 instanceof Error ? error45.message : String(error45);
             return errorResult(format, `Failed to start job "${job.name}": ${msg}`);
           }
-          const logs = getJobLogs(job.slug);
+          const logs = getJobLogs(runJob);
           const attachHint = runOverride.attachUrl ? `
 Attach: opencode attach ${runOverride.attachUrl}` : "";
           const logSection = logs ? `
@@ -13915,8 +14460,8 @@ Logs: ${runResult.logPath}${attachHint}${logSection}`, {
             return errorResult(format, `Job "${args.name}" not found.`);
           }
           const tailLines = typeof args.lines === "number" && Number.isFinite(args.lines) ? args.lines : 200;
-          const logs = getJobLogs(job.slug, { tailLines, maxChars: 20000 });
-          const logPath = getLogPath(job.slug);
+          const logs = getJobLogs(job, { tailLines, maxChars: 20000 });
+          const logPath = getLogPath(job);
           if (!logs) {
             return okResult(format, `No logs found for "${job.name}". The job may not have run yet.`, {
               job,

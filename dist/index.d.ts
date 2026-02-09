@@ -2,7 +2,7 @@
  * OpenCode Scheduler Plugin
  *
  * Schedule recurring jobs using launchd (Mac) or systemd (Linux).
- * Jobs are stored in ~/.config/opencode/jobs/
+ * Jobs are stored under ~/.config/opencode/scheduler/ (scoped by workdir).
  *
  * Features:
  * - Survives reboots
