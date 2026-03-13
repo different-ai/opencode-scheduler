@@ -52,6 +52,17 @@ Schedule a job every 6 hours to check if my website is up and alert me on Slack 
 | Delete | `Delete the standing-desk job` |
 | Global cleanup (dry run) | `Run scheduler global cleanup` |
 
+## Slash Commands
+
+Type `/scheduler-` in OpenCode to see autocomplete suggestions. These commands invoke the corresponding tools directly.
+
+| Command | Description | Example |
+|---------|-------------|---------|
+| `/scheduler-list` | 列出当前 scope 或全部 scope 的任务 | `/scheduler-list allScopes=true` |
+| `/scheduler-get` | 查看某个任务的详情 | `/scheduler-get standing-desk` |
+| `/scheduler-logs` | 查看某个任务的日志 | `/scheduler-logs standing-desk` |
+| `/scheduler-delete` | 删除某个任务（危险操作） | `/scheduler-delete standing-desk` |
+
 ## How It Works
 
 1. You describe what you want scheduled in natural language
