@@ -21,6 +21,7 @@
     "release:patch": "npm version patch && npm publish",
     "release:minor": "npm version minor && npm publish",
     "release:major": "npm version major && npm publish",
+    "test": "bun test",
     "typecheck": "tsc --noEmit"
   },
   "keywords": [
