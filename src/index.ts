@@ -18,6 +18,7 @@ import { basename, dirname, join, resolve as resolvePath } from "path"
 import { homedir, platform } from "os"
 import { execFileSync, execSync, spawn, type ChildProcess } from "child_process"
 import { fileURLToPath } from "url"
+import { applySchedulerCommands } from "./commands"
 
 // Storage location - shared with other opencode tools
 const OPENCODE_CONFIG = join(homedir(), ".config", "opencode")
@@ -2536,6 +2537,9 @@ function getJobLogs(job: Job, options?: { tailLines?: number; maxChars?: number 
 
 export const SchedulerPlugin: Plugin = async () => {
   return {
+    async config(input) {
+      applySchedulerCommands(input)
+    },
     tool: {
        schedule_job: tool({
            description:
