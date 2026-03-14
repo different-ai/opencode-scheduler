@@ -4,22 +4,22 @@ export const schedulerCommands: Record<
 > = {
   "scheduler-list": {
     template: "Use the list_jobs tool to show all scheduled jobs. $ARGUMENTS",
-    description: "列出当前 scope 或全部 scope 的任务",
+    description: "List jobs in current scope or all scopes",
   },
   "scheduler-get": {
     template:
       "Use the get_job tool to show details for the job named: $ARGUMENTS",
-    description: "查看某个任务的详情",
+    description: "Show details for a specific job",
   },
   "scheduler-logs": {
     template:
       "Use the job_logs tool to show recent logs for the job named: $ARGUMENTS",
-    description: "查看某个任务的日志",
+    description: "Show recent logs for a job",
   },
   "scheduler-delete": {
     template:
       "Use the delete_job tool to delete the job named: $ARGUMENTS. IMPORTANT: You must confirm the deletion with the user before proceeding.",
-    description: "删除某个任务（危险操作）",
+    description: "Delete a job (destructive operation)",
   },
 }
 

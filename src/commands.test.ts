@@ -1,4 +1,4 @@
-import { describe, test, expect } from "bun:test"
+import { describe, test, expect } from "vitest"
 import { schedulerCommands, applySchedulerCommands } from "./commands"
 
 describe("schedulerCommands", () => {
@@ -10,7 +10,7 @@ describe("schedulerCommands", () => {
     )
   })
 
-  test("every command has a non-empty template string", () => {
+  test("every command has a non-wempty template string", () => {
     for (const [name, cmd] of Object.entries(schedulerCommands)) {
       expect(typeof cmd.template).toBe("string")
       expect(cmd.template.length).toBeGreaterThan(0)

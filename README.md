@@ -58,10 +58,10 @@ Type `/scheduler-` in OpenCode to see autocomplete suggestions. These commands i
 
 | Command | Description | Example |
 |---------|-------------|---------|
-| `/scheduler-list` | 列出当前 scope 或全部 scope 的任务 | `/scheduler-list allScopes=true` |
-| `/scheduler-get` | 查看某个任务的详情 | `/scheduler-get standing-desk` |
-| `/scheduler-logs` | 查看某个任务的日志 | `/scheduler-logs standing-desk` |
-| `/scheduler-delete` | 删除某个任务（危险操作） | `/scheduler-delete standing-desk` |
+| `/scheduler-list` | List jobs in current scope or all scopes | `/scheduler-list allScopes=true` |
+| `/scheduler-get` | Show details for a specific job | `/scheduler-get standing-desk` |
+| `/scheduler-logs` | Show recent logs for a job | `/scheduler-logs standing-desk` |
+| `/scheduler-delete` | Delete a job (destructive operation) | `/scheduler-delete standing-desk` |
 
 ## How It Works
 
