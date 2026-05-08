@@ -1,12 +1,16 @@
 // @bun
 var __defProp = Object.defineProperty;
+var __returnValue = (v) => v;
+function __exportSetter(name, newValue) {
+  this[name] = __returnValue.bind(null, newValue);
+}
 var __export = (target, all) => {
   for (var name in all)
     __defProp(target, name, {
       get: all[name],
       enumerable: true,
       configurable: true,
-      set: (newValue) => all[name] = () => newValue
+      set: __exportSetter.bind(all, name)
     });
 };
 
@@ -12331,30 +12335,263 @@ function tool(input) {
 }
 tool.schema = exports_external;
 // src/index.ts
-import { createWriteStream, existsSync, mkdirSync, readdirSync, readFileSync, rmSync, writeFileSync, unlinkSync } from "fs";
-import { basename, dirname, join, resolve as resolvePath } from "path";
-import { homedir, platform } from "os";
+import { chmodSync, createWriteStream, existsSync as existsSync3, mkdirSync as mkdirSync3, readdirSync as readdirSync2, readFileSync as readFileSync3, renameSync as renameSync3, rmSync, writeFileSync as writeFileSync2, unlinkSync as unlinkSync2 } from "fs";
+import { basename, dirname as dirname2, join as join3, resolve as resolvePath } from "path";
+import { homedir as homedir3, platform } from "os";
 import { execFileSync, execSync, spawn } from "child_process";
 import { fileURLToPath } from "url";
-var OPENCODE_CONFIG = join(homedir(), ".config", "opencode");
-var LEGACY_JOBS_DIR = join(OPENCODE_CONFIG, "jobs");
-var LOGS_DIR = join(OPENCODE_CONFIG, "logs");
-var SCHEDULER_DIR = join(OPENCODE_CONFIG, "scheduler");
-var SCOPES_DIR = join(SCHEDULER_DIR, "scopes");
-var SUPERVISOR_PATH = join(SCHEDULER_DIR, "supervisor.pl");
-var SCHEDULER_CONFIG = join(OPENCODE_CONFIG, "opencode-scheduler.json");
+
+// src/registry.ts
+import { existsSync, mkdirSync, readFileSync, readdirSync, renameSync, unlinkSync, writeFileSync } from "fs";
+import { homedir } from "os";
+import { join } from "path";
+var REGISTRY_SCHEMA_VERSION = 1;
+function getRuntimeDir() {
+  return process.env.OPENCODE_SCHEDULER_RUNTIME_DIR ?? join(homedir(), ".local", "share", "opencode", "runtime");
+}
+function entryPath(dir, pid) {
+  return join(dir, `${pid}.json`);
+}
+function writeRegistryEntry(entry, dir = getRuntimeDir()) {
+  if (!existsSync(dir))
+    mkdirSync(dir, { recursive: true, mode: 448 });
+  const finalPath = entryPath(dir, entry.pid);
+  const tmpPath = `${finalPath}.tmp.${process.pid}.${Date.now()}`;
+  writeFileSync(tmpPath, JSON.stringify(entry), { mode: 384 });
+  renameSync(tmpPath, finalPath);
+  return finalPath;
+}
+function removeRegistryEntry(pid, dir = getRuntimeDir()) {
+  try {
+    unlinkSync(entryPath(dir, pid));
+  } catch {}
+}
+function isPidAlive(pid) {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (err) {
+    const code = err.code;
+    return code === "EPERM";
+  }
+}
+function readRegistryEntry(path) {
+  try {
+    const raw = readFileSync(path, "utf-8");
+    const parsed = JSON.parse(raw);
+    if (parsed && typeof parsed === "object" && parsed.schemaVersion === REGISTRY_SCHEMA_VERSION && typeof parsed.pid === "number" && typeof parsed.port === "number" && typeof parsed.url === "string" && typeof parsed.workdir === "string" && typeof parsed.startedAt === "string") {
+      return parsed;
+    }
+    return null;
+  } catch {
+    return null;
+  }
+}
+function sweepStaleEntries(dir = getRuntimeDir()) {
+  if (!existsSync(dir))
+    return { scanned: 0, removed: 0 };
+  const files = readdirSync(dir).filter((file2) => file2.endsWith(".json") && !file2.endsWith(".tmp.json"));
+  let removed = 0;
+  for (const file2 of files) {
+    const path = join(dir, file2);
+    const entry = readRegistryEntry(path);
+    const dead = !entry || !isPidAlive(entry.pid);
+    if (dead) {
+      try {
+        unlinkSync(path);
+        removed += 1;
+      } catch {}
+    }
+  }
+  return { scanned: files.length, removed };
+}
+
+// src/serverConfig.ts
+import { closeSync, existsSync as existsSync2, fsyncSync, mkdirSync as mkdirSync2, openSync, readFileSync as readFileSync2, renameSync as renameSync2, writeSync } from "fs";
+import { homedir as homedir2 } from "os";
+import { dirname, join as join2 } from "path";
+var DEFAULT_OPENCODE_CONFIG_PATH = join2(homedir2(), ".config", "opencode", "opencode.json");
+var DEFAULT_SERVER_PORT = 0;
+function readOpencodeConfig(path = DEFAULT_OPENCODE_CONFIG_PATH) {
+  if (!existsSync2(path))
+    return {};
+  const raw = readFileSync2(path, "utf-8");
+  if (!raw.trim())
+    return {};
+  const parsed = JSON.parse(raw);
+  if (parsed === null || typeof parsed !== "object" || Array.isArray(parsed)) {
+    throw new Error(`Config at ${path} is not a JSON object (got ${Array.isArray(parsed) ? "array" : typeof parsed}).`);
+  }
+  return parsed;
+}
+function planServerConfigUpdate(current, desiredPort) {
+  const before = current;
+  const existingServer = current.server;
+  const serverIsObject = existingServer !== null && typeof existingServer === "object" && !Array.isArray(existingServer);
+  if (!serverIsObject) {
+    const after2 = { ...current, server: { port: desiredPort } };
+    return {
+      action: { kind: "add-server", port: desiredPort },
+      before,
+      after: after2,
+      diff: `+ server: { port: ${desiredPort} }`
+    };
+  }
+  const serverObj = existingServer;
+  const existingPortRaw = serverObj.port;
+  if (existingPortRaw === undefined) {
+    const after2 = { ...current, server: { ...serverObj, port: desiredPort } };
+    return {
+      action: { kind: "add-port", port: desiredPort },
+      before,
+      after: after2,
+      diff: `+ server.port: ${desiredPort}`
+    };
+  }
+  if (existingPortRaw === desiredPort) {
+    return {
+      action: { kind: "noop", reason: "port-already-matches" },
+      before,
+      after: current,
+      diff: `(no change \u2014 server.port is already ${desiredPort})`
+    };
+  }
+  if (typeof existingPortRaw !== "number") {
+    throw new Error(`Existing server.port is not a number (${typeof existingPortRaw}); refuse to overwrite blindly.`);
+  }
+  const after = { ...current, server: { ...serverObj, port: desiredPort } };
+  return {
+    action: { kind: "overwrite-port", previous: existingPortRaw, next: desiredPort },
+    before,
+    after,
+    diff: `~ server.port: ${existingPortRaw} \u2192 ${desiredPort}`
+  };
+}
+function writeOpencodeConfigAtomic(path, next) {
+  const dir = dirname(path);
+  if (!existsSync2(dir))
+    mkdirSync2(dir, { recursive: true, mode: 448 });
+  const serialized = JSON.stringify(next, null, 2) + `
+`;
+  const tmpPath = `${path}.tmp.${process.pid}.${Date.now()}`;
+  const fd = openSync(tmpPath, "w", 384);
+  try {
+    writeSync(fd, serialized);
+    fsyncSync(fd);
+  } finally {
+    closeSync(fd);
+  }
+  renameSync2(tmpPath, path);
+  try {
+    const dirFd = openSync(dir, "r");
+    try {
+      fsyncSync(dirFd);
+    } finally {
+      closeSync(dirFd);
+    }
+  } catch {}
+  const roundTrip = readFileSync2(path, "utf-8");
+  JSON.parse(roundTrip);
+  return { written: path, serialized };
+}
+function executeInstallServerConfig(args) {
+  const port = args.port ?? DEFAULT_SERVER_PORT;
+  if (!Number.isInteger(port) || port < 0 || port > 65535) {
+    return {
+      ok: false,
+      status: "invalid-port",
+      reason: `port must be an integer in [0, 65535] (got ${args.port}).`
+    };
+  }
+  const configPath = args.configPath ?? DEFAULT_OPENCODE_CONFIG_PATH;
+  let current;
+  try {
+    current = readOpencodeConfig(configPath);
+  } catch (error45) {
+    return {
+      ok: false,
+      status: "read-error",
+      reason: error45 instanceof Error ? error45.message : String(error45),
+      configPath
+    };
+  }
+  let plan;
+  try {
+    plan = planServerConfigUpdate(current, port);
+  } catch (error45) {
+    return {
+      ok: false,
+      status: "plan-error",
+      reason: error45 instanceof Error ? error45.message : String(error45),
+      configPath
+    };
+  }
+  if (plan.action.kind === "noop") {
+    return { ok: true, status: "noop", plan, configPath };
+  }
+  if (plan.action.kind === "overwrite-port" && !args.overwrite) {
+    return { ok: false, status: "needs-overwrite", plan, configPath };
+  }
+  if (!args.confirm) {
+    return { ok: true, status: "preview", plan, configPath };
+  }
+  try {
+    writeOpencodeConfigAtomic(configPath, plan.after);
+  } catch (error45) {
+    return {
+      ok: false,
+      status: "write-error",
+      reason: error45 instanceof Error ? error45.message : String(error45),
+      configPath
+    };
+  }
+  return { ok: true, status: "written", plan, configPath };
+}
+
+// src/index.ts
+var OPENCODE_CONFIG = join3(homedir3(), ".config", "opencode");
+var LEGACY_JOBS_DIR = join3(OPENCODE_CONFIG, "jobs");
+var LOGS_DIR = join3(OPENCODE_CONFIG, "logs");
+var SCHEDULER_DIR = join3(OPENCODE_CONFIG, "scheduler");
+var SCOPES_DIR = join3(SCHEDULER_DIR, "scopes");
+var SUPERVISOR_PATH = join3(SCHEDULER_DIR, "supervisor.pl");
+var SCHEDULER_CONFIG = join3(OPENCODE_CONFIG, "opencode-scheduler.json");
 var IS_MAC = platform() === "darwin";
 var IS_LINUX = platform() === "linux";
 var IS_WINDOWS = platform() === "win32";
-var LAUNCH_AGENTS_DIR = join(homedir(), "Library", "LaunchAgents");
+var LAUNCH_AGENTS_DIR = join3(homedir3(), "Library", "LaunchAgents");
 var LAUNCHD_PREFIX = "com.opencode.job";
-var SYSTEMD_USER_DIR = join(homedir(), ".config", "systemd", "user");
+var SYSTEMD_USER_DIR = join3(homedir3(), ".config", "systemd", "user");
 var WINDOWS_TASK_ROOT = "\\OpenCode";
 var WINDOWS_TASK_PREFIX = "opencode-job";
 var CRON_MANAGED_PREFIX = "opencode-scheduler";
 function ensureDir(dir) {
-  if (!existsSync(dir)) {
-    mkdirSync(dir, { recursive: true });
+  if (!existsSync3(dir)) {
+    mkdirSync3(dir, { recursive: true });
+  }
+}
+function ensureDirUserOnly(dir) {
+  ensureDir(dir);
+  try {
+    chmodSync(dir, 448);
+  } catch {}
+}
+function writeFileUserOnly(path, content) {
+  const tmp = `${path}.tmp`;
+  writeFileSync2(tmp, content);
+  try {
+    chmodSync(tmp, 384);
+  } catch {}
+  try {
+    renameSync3(tmp, path);
+  } catch {
+    writeFileSync2(path, content);
+    try {
+      chmodSync(path, 384);
+    } catch {}
+    try {
+      unlinkSync2(tmp);
+    } catch {}
   }
 }
 function slugify(name) {
@@ -12363,7 +12600,7 @@ function slugify(name) {
 function normalizeWorkdirPath(input) {
   const trimmed = input.trim();
   if (!trimmed)
-    return homedir();
+    return homedir3();
   return resolvePath(trimmed);
 }
 function fnv1a64(input) {
@@ -12386,25 +12623,25 @@ function deriveScopeId(workdir) {
   return `${base}-${suffix}`;
 }
 function scopeDir(scopeId) {
-  return join(SCOPES_DIR, scopeId);
+  return join3(SCOPES_DIR, scopeId);
 }
 function scopeJobsDir(scopeId) {
-  return join(scopeDir(scopeId), "jobs");
+  return join3(scopeDir(scopeId), "jobs");
 }
 function scopeLocksDir(scopeId) {
-  return join(scopeDir(scopeId), "locks");
+  return join3(scopeDir(scopeId), "locks");
 }
 function scopeRunsDir(scopeId) {
-  return join(scopeDir(scopeId), "runs");
+  return join3(scopeDir(scopeId), "runs");
 }
 function scopeLogsDir(scopeId) {
-  return join(LOGS_DIR, "scheduler", scopeId);
+  return join3(LOGS_DIR, "scheduler", scopeId);
 }
 function jobFilePath(scopeId, slug) {
-  return join(scopeJobsDir(scopeId), `${slug}.json`);
+  return join3(scopeJobsDir(scopeId), `${slug}.json`);
 }
 function scopedLogPath(scopeId, slug) {
-  return join(scopeLogsDir(scopeId), `${slug}.log`);
+  return join3(scopeLogsDir(scopeId), `${slug}.log`);
 }
 function currentScopeId() {
   return deriveScopeId(process.cwd());
@@ -12445,6 +12682,9 @@ sub write_json_atomic {
   print $fh $json->encode($data);
   close $fh or die "Failed to close $tmp: $!
 ";
+  # 0600 \u2014 job files contain env.snapshot which may include secrets.
+  # rename preserves the source perms, so we chmod the temp first.
+  chmod 0600, $tmp;
   rename $tmp, $path or die "Failed to rename $tmp -> $path: $!
 ";
 }
@@ -12531,6 +12771,28 @@ delete $job->{lastRunError};
 $job->{updatedAt} = $started_at;
 write_json_atomic($job_path, $job);
 
+# Merge per-job env snapshot into %ENV before scheduler-only overrides.
+# Snapshot wins over launchd/systemd-provided env; scheduler-only keys
+# (OPENCODE_PERMISSION, OPENCODE_SCHEDULER_RUN_ID) wins over snapshot.
+#
+# Legacy jobs without job.env get a one-line warning printed into the
+# log; they fall back to whatever env launchd/systemd handed us, which
+# is just PATH for jobs created with v1.3.x.
+if (!$job->{env} || ref($job->{env}) ne 'HASH') {
+  print "[opencode-scheduler] WARN: job has no env snapshot (created with v1.3.x); ",
+        "recreate the job to capture the full terminal env.\\n";
+} else {
+  # The mode (snapshot/minimal/login-shell) was already applied at capture
+  # time when env.snapshot was populated \u2014 supervisor only has to merge
+  # whatever is already there. login-shell wrap is in job.invocation.
+  my $snap = $job->{env}->{snapshot};
+  if ($snap && ref($snap) eq 'HASH') {
+    for my $k (keys %$snap) {
+      $ENV{$k} = $snap->{$k};
+    }
+  }
+}
+
 # Force non-interactive scheduled runs
 my $perm = { question => "deny" };
 if ($ENV{OPENCODE_PERMISSION}) {
@@ -12564,6 +12826,78 @@ my $command = $inv->{command};
 my @args = @{ $inv->{args} };
 
 my $workdir = $job->{workdir} || $home;
+
+# === Runner-first delivery (S5) ===
+#
+# When the job has a live-delivery target (attachUrl) and runs aren't
+# explicitly headless-only, try the bundled runner first. It performs
+# health/idle/busy preflight + HTTP prompt_async; on exit 10 we fall
+# through to the headless invocation.
+#
+# Resolution rules:
+#   - Look for runner at <plugin>/dist/runner.js
+#   - The runner path is recorded via OPENCODE_SCHEDULER_RUNNER_PATH if
+#     present (set by the plugin at install time); otherwise we probe a
+#     conventional location in ~/.config/opencode/scheduler/runner.js.
+my $runner_path = $ENV{OPENCODE_SCHEDULER_RUNNER_PATH} || "$home/.config/opencode/scheduler/runner.js";
+my $execution_policy = $job->{executionPolicy} || "prefer-live-server";
+my $live_target = "";
+if ($job->{run} && ref($job->{run}) eq 'HASH' && $job->{run}->{attachUrl}) {
+  $live_target = $job->{run}->{attachUrl};
+} elsif ($job->{attachUrl}) {
+  $live_target = $job->{attachUrl};
+}
+
+my $tried_live = 0;
+my $live_exit = -1;
+if ($live_target && $execution_policy ne "headless-only" && -f $runner_path) {
+  $tried_live = 1;
+  print "
+=== runner: live delivery attempt to $live_target ===
+";
+  my @runner_cmd = ("/usr/bin/env", "node", $runner_path, "--job", $job_path);
+  if ($job->{timeoutSeconds}) {
+    push @runner_cmd, "--timeout-seconds", $job->{timeoutSeconds};
+  }
+  my $rc = system(@runner_cmd);
+  $live_exit = ($rc == -1) ? 10 : ($rc >> 8);
+  if ($live_exit == 0) {
+    my $now = iso_now();
+    print "
+=== runner: live delivery success $now ===
+";
+    $job->{lastRunStatus} = "success";
+    $job->{lastRunExitCode} = 0;
+    $job->{updatedAt} = $now;
+    write_json_atomic($job_path, $job);
+    unlink $lock_path;
+    exit 0;
+  }
+  if ($live_exit == 11) {
+    my $now = iso_now();
+    print "
+=== runner: contract error (exit 11) $now; not falling back ===
+";
+    $job->{lastRunStatus} = "failed";
+    $job->{lastRunExitCode} = 11;
+    $job->{lastRunError} = "runner contract error";
+    $job->{updatedAt} = $now;
+    write_json_atomic($job_path, $job);
+    unlink $lock_path;
+    exit 11;
+  }
+  print "
+=== runner: live delivery failed (exit $live_exit); falling back to headless ===
+";
+
+  # Use headlessInvocation if present so we don't pass --attach again.
+  if ($job->{headlessInvocation} && ref($job->{headlessInvocation}) eq 'HASH'
+      && $job->{headlessInvocation}->{command}
+      && ref($job->{headlessInvocation}->{args}) eq 'ARRAY') {
+    $command = $job->{headlessInvocation}->{command};
+    @args = @{ $job->{headlessInvocation}->{args} };
+  }
+}
 
 my $timeout = $job->{timeoutSeconds};
 $timeout = undef if defined($timeout) && $timeout !~ /^\\d+$/;
@@ -12663,8 +12997,85 @@ exit($exit_code);
 `;
 function ensureSupervisorScript() {
   ensureDir(SCHEDULER_DIR);
-  writeFileSync(SUPERVISOR_PATH, SUPERVISOR_SCRIPT);
+  writeFileSync2(SUPERVISOR_PATH, SUPERVISOR_SCRIPT);
+  ensureRunnerScript();
 }
+var RUNNER_PATH = join3(SCHEDULER_DIR, "runner.js");
+function ensureRunnerScript() {
+  try {
+    const here = dirname2(fileURLToPath(import.meta.url));
+    const candidates = [
+      join3(here, "runner.js"),
+      join3(here, "..", "dist", "runner.js")
+    ];
+    for (const candidate of candidates) {
+      if (existsSync3(candidate)) {
+        writeFileSync2(RUNNER_PATH, readFileSync3(candidate));
+        return;
+      }
+    }
+  } catch {}
+}
+var ENV_DENYLIST_INTERNAL = new Set([
+  "OPENCODE_PERMISSION",
+  "OPENCODE_SCHEDULER_RUN_ID",
+  "OLDPWD",
+  "PWD",
+  "SHLVL",
+  "_"
+]);
+var ENV_MINIMAL_KEYS = ["PATH", "HOME", "USER", "SHELL"];
+var warnedLegacyEnvKeys = false;
+function warnLegacyEnvKeysOnce(keys) {
+  if (warnedLegacyEnvKeys)
+    return;
+  warnedLegacyEnvKeys = true;
+  console.warn(`[opencode-scheduler] config keys [${keys.join(", ")}] are deprecated and ignored as of v1.4. ` + `Use env.mode = 'snapshot' | 'minimal' | 'login-shell' and env.exclude / env.set instead.`);
+}
+function buildEnvDenylist(extra) {
+  const denylist = new Set(ENV_DENYLIST_INTERNAL);
+  for (const key of extra ?? []) {
+    const trimmed = key.trim();
+    if (trimmed)
+      denylist.add(trimmed);
+  }
+  return denylist;
+}
+function captureJobEnv(config2) {
+  const mode = config2?.mode ?? "snapshot";
+  const denylist = buildEnvDenylist(config2?.exclude);
+  const snapshot = {};
+  if (mode === "minimal") {
+    for (const key of ENV_MINIMAL_KEYS) {
+      const value = process.env[key];
+      if (typeof value === "string" && value.length > 0) {
+        snapshot[key] = value;
+      }
+    }
+  } else {
+    for (const [key, value] of Object.entries(process.env)) {
+      if (denylist.has(key))
+        continue;
+      if (typeof value !== "string")
+        continue;
+      snapshot[key] = value;
+    }
+  }
+  for (const [key, value] of Object.entries(config2?.set ?? {})) {
+    if (denylist.has(key))
+      continue;
+    snapshot[key] = String(value);
+  }
+  if (!snapshot.PATH) {
+    snapshot.PATH = getEnhancedPath({ withTerminalPath: true });
+  }
+  return { mode, snapshot };
+}
+var SCHEDULED_PERMS = [
+  { permission: "question", action: "deny", pattern: "*" },
+  { permission: "plan_enter", action: "deny", pattern: "*" },
+  { permission: "plan_exit", action: "deny", pattern: "*" }
+];
 function normalizeFormat(format) {
   return format === "json" ? "json" : "text";
 }
@@ -12702,6 +13113,105 @@ Then write your task below it.
 3. **Idempotent.** Make reruns safe (maintain a seen/state file; avoid duplicate messages).
 4. **Observable.** Print a short summary at the end with status + outputs.
 5. **Minimal side effects.** Write durable artifacts under outputs/ in the job workdir.
+
+## Choosing a Session Policy
+
+\`schedule_job\` REQUIRES an explicit \`sessionPolicy\` \u2014 there is no default.
+Always ask the user which one fits their intent before scheduling; a silent
+default leads to silent failures (job runs, TUI never refreshes). Pick by
+what you want the run to feel like in the TUI:
+
+| Policy          | When                                                                                  | Effect                                                                                 |
+| --------------- | ------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------- |
+| \`current\`     | "Stream into the chat where I'm scheduling from."                                     | Uses the calling tool's session. Permission rules of that session are unchanged.       |
+| \`existing\`    | "Stream into a specific session I created earlier."                                   | Requires explicit \`sessionId\`. Session permissions unchanged.                        |
+| \`new-per-job\` | "One fresh session that all fires of this job append to."                             | Plugin creates the session at schedule-time with auto-deny on \`question\`/\`plan_*\`. |
+| \`new-per-run\` | "Each fire gets its own brand-new session."                                           | Runner creates a session per fire with the same auto-deny permissions.                 |
+
+Notes:
+
+- \`current\` and \`existing\` do NOT mutate session permissions \u2014 if the
+  session was created interactively, it can still ask questions. Pick
+  \`new-per-job\` / \`new-per-run\` when you need guaranteed silence.
+- An explicit \`sessionId\` beats the calling-tool session: passing both is
+  treated as "use this id".
+
+## Delivery and Execution Policies
+
+Two orthogonal flags control what the job actually does at fire time:
+
+- \`executionPolicy\` (default: \`headless-then-attach\`):
+  - \`headless-then-attach\` \u2014 run the prompt headlessly first, then attach
+    output to the target session. Default.
+  - \`headless-only\` \u2014 never attach. Use for non-interactive workers that
+    only need to write artifacts.
+- \`deliveryPolicy\` (default: \`execute\`):
+  - \`execute\` \u2014 actually run the job. Normal mode.
+  - \`leave-message\` \u2014 do NOT execute the prompt; only post a notification
+    message into the session. Pair with an \`existing\`/\`current\` session
+    so the user sees it.
+
+\`leave-message\` skips execution entirely; only set it when you really
+just want a heads-up dropped into a session.
+
+## Auto-Permissions for new-per-* Sessions
+
+When the plugin creates a session for you (\`new-per-job\` or
+\`new-per-run\`), it bakes in:
+
+- \`question\`     \u2192 \`deny\` for \`*\`
+- \`plan_enter\`   \u2192 \`deny\` for \`*\`
+- \`plan_exit\`    \u2192 \`deny\` for \`*\`
+
+This is enforced server-side, so the model cannot stall the run by asking
+for confirmation or entering plan mode. There is no public \`PATCH\` route
+to mutate an existing session's permissions, which is why \`current\` /
+\`existing\` are not modified.
+
+## Env Parity
+
+At schedule-time the plugin captures the **full terminal env** as a
+per-job snapshot, minus a small denylist
+(\`OPENCODE_PERMISSION\`, \`OPENCODE_SCHEDULER_RUN_ID\`, \`OLDPWD\`,
+\`PWD\`, \`SHLVL\`, \`_\`). The snapshot lives in \`job.json\`; the OS
+scheduler entry (launchd plist, systemd unit, cron preamble) only
+gets the bootstrap env (\`PATH\`, \`HOME\`, \`USER\`, \`SHELL\`).
+\`supervisor.pl\` merges the full snapshot back into \`%ENV\` before
+exec.
+
+What this fixes:
+
+- \`env: node: No such file or directory\` on hosts using NVM / asdf /
+  mise / Volta / Bun without baking only PATH.
+- Lost MCP / plugin tokens (\`OPENCODE_API_KEY\`, MCP server credentials,
+  etc.) \u2014 they carry over because the snapshot is full.
+
+You do not have to do anything in the prompt. If a particular env var
+should NOT be carried, scrub it from the calling shell BEFORE running
+\`schedule_job\`, or extend the denylist in your \`.opencode/config\` env
+section.
+
+## Remote Sessions (attachUrl)
+
+To run against a remote opencode server, pass \`attachUrl\`. The plugin
+will use REST against that URL for both session creation
+(\`new-per-job\`) and verification (\`current\` / \`existing\`). Without
+\`attachUrl\`, all session work goes through the in-process plugin
+client, which does NOT need an open HTTP port.
+
+At fire-time, when the job has no persisted \`attachUrl\`, the runner
+also consults the F5 plugin-side runtime registry
+(\`~/.local/share/opencode/runtime/<pid>.json\`). Every opencode that
+loads this plugin and is reachable externally publishes its own
+entry there, so a sibling TUI launched with \`--port\` can become the
+delivery target automatically \u2014 you only need to pass \`attachUrl\`
+explicitly for cross-host or otherwise non-discoverable targets.
+
+To make every opencode start register itself automatically (without
+adding \`--port\` to every shell alias), run \`install_server_config\`
+once. It writes \`server.port: 0\` (= try 4096, then OS-assigned
+random) into \`~/.config/opencode/opencode.json\`. The tool is
+two-step (preview \u2192 confirm) and idempotent \u2014 see README.
 
 ## Runtime Values: Dates
 
@@ -12791,29 +13301,49 @@ function installBuiltinSkill(skill, rootDir, overwrite = false) {
   if (!installRoot) {
     throw new Error("Install directory cannot be empty.");
   }
-  if (!existsSync(installRoot)) {
+  if (!existsSync3(installRoot)) {
     throw new Error(`Directory not found: ${installRoot}`);
   }
-  const relativeDir = dirname(skill.suggestedPath);
-  const installDir = join(installRoot, relativeDir);
+  const relativeDir = dirname2(skill.suggestedPath);
+  const installDir = join3(installRoot, relativeDir);
   ensureDir(installDir);
   const files = [];
   for (const [filename, content] of Object.entries(skill.files)) {
-    const targetPath = join(installDir, filename);
-    if (existsSync(targetPath) && !overwrite) {
+    const targetPath = join3(installDir, filename);
+    if (existsSync3(targetPath) && !overwrite) {
       throw new Error(`File already exists: ${targetPath} (pass overwrite=true to replace)`);
     }
-    writeFileSync(targetPath, `${content.trimEnd()}
+    writeFileSync2(targetPath, `${content.trimEnd()}
 `);
     files.push(targetPath);
   }
   return { directory: installDir, files };
 }
+function ensureBestPracticesSkill(workdir) {
+  const skill = SCHEDULED_JOB_BEST_PRACTICES_SKILL;
+  if (Object.keys(skill.files).length !== 1) {
+    throw new Error(`ensureBestPracticesSkill assumes a single-file skill; ${skill.name} now has ${Object.keys(skill.files).length} files. Update the presence check before adding more.`);
+  }
+  const expectedPath = join3(workdir, skill.suggestedPath);
+  if (existsSync3(expectedPath)) {
+    return { status: "present", path: expectedPath };
+  }
+  try {
+    installBuiltinSkill(skill, workdir, false);
+    return { status: "installed", path: expectedPath };
+  } catch (error45) {
+    return {
+      status: "failed",
+      path: expectedPath,
+      reason: error45 instanceof Error ? error45.message : String(error45)
+    };
+  }
+}
 function loadPackageInfo() {
   const fallback = { name: "opencode-scheduler", version: "unknown" };
   try {
-    const packagePath = join(dirname(fileURLToPath(import.meta.url)), "..", "package.json");
-    const raw = readFileSync(packagePath, "utf-8");
+    const packagePath = join3(dirname2(fileURLToPath(import.meta.url)), "..", "package.json");
+    const raw = readFileSync3(packagePath, "utf-8");
     const parsed = JSON.parse(raw);
     return {
       name: typeof parsed.name === "string" ? parsed.name : fallback.name,
@@ -12829,7 +13359,7 @@ function findOpencode() {
     return override;
   try {
     const resolved = execSync("command -v opencode", {
-      env: { ...process.env, PATH: getEnhancedPath() + ":" + (process.env.PATH ?? "") },
+      env: { ...process.env, PATH: getEnhancedPath({ withTerminalPath: false }) + ":" + (process.env.PATH ?? "") },
       stdio: ["ignore", "pipe", "ignore"]
     }).toString().trim();
     if (resolved) {
@@ -12841,17 +13371,17 @@ function findOpencode() {
   const paths = [
     "/opt/homebrew/bin/opencode",
     "/usr/local/bin/opencode",
-    join(homedir(), ".opencode", "bin", "opencode")
+    join3(homedir3(), ".opencode", "bin", "opencode")
   ];
   for (const p of paths) {
-    if (existsSync(p)) {
+    if (existsSync3(p)) {
       return p;
     }
   }
   return "opencode";
 }
-function getEnhancedPath() {
-  const paths = [
+function getEnhancedPath(options) {
+  const fallback = [
     "/opt/homebrew/bin",
     "/usr/local/bin",
     "/usr/bin",
@@ -12859,7 +13389,19 @@ function getEnhancedPath() {
     "/usr/sbin",
     "/sbin"
   ];
-  return paths.join(":");
+  const withTerminal = options?.withTerminalPath !== false;
+  const terminal = withTerminal ? (process.env.PATH ?? "").split(":").filter(Boolean) : [];
+  const seen = new Set;
+  const merged = [];
+  for (const entry of [...terminal, ...fallback]) {
+    if (!entry)
+      continue;
+    if (seen.has(entry))
+      continue;
+    seen.add(entry);
+    merged.push(entry);
+  }
+  return merged.join(":");
 }
 function splitCronExpression(cron) {
   const parts = cron.trim().split(/\s+/);
@@ -12955,6 +13497,36 @@ function escapePlistString(value) {
 function escapeSystemdArg(value) {
   return value.replace(/\\/g, "\\\\").replace(/"/g, "\\\"");
 }
+var ENV_BOOTSTRAP_KEYS = ["PATH", "HOME", "USER", "SHELL"];
+function pickBootstrapEnv(job, terminalPath) {
+  const out = {};
+  const snapshot = job.env?.snapshot;
+  for (const key of ENV_BOOTSTRAP_KEYS) {
+    const fromSnap = snapshot?.[key];
+    const fromProc = process.env[key];
+    const value = fromSnap ?? fromProc;
+    if (typeof value === "string" && value.length > 0) {
+      out[key] = value;
+    }
+  }
+  out.PATH = terminalPath;
+  return out;
+}
+function renderLaunchdEnvDict(job, terminalPath) {
+  const entries = pickBootstrapEnv(job, terminalPath);
+  return Object.keys(entries).sort().map((key) => `    <key>${escapePlistString(key)}</key>
+    <string>${escapePlistString(entries[key] ?? "")}</string>`).join(`
+`);
+}
+function renderSystemdEnvLines(job, terminalPath) {
+  const entries = pickBootstrapEnv(job, terminalPath);
+  return Object.keys(entries).sort().map((key) => `Environment="${escapeSystemdArg(key)}=${escapeSystemdArg(entries[key] ?? "")}"`).join(`
+`);
+}
+function renderCronEnvPreamble(job, terminalPath) {
+  const entries = pickBootstrapEnv(job, terminalPath);
+  return Object.keys(entries).sort().map((key) => `${key}="${shellEscapeDoubleQuoted(entries[key] ?? "")}"`).join(" ");
+}
 function renderLaunchdCalendar(calendar) {
   return Object.entries(calendar).map(([key, value]) => `    <key>${key}</key>
     <integer>${value}</integer>`).join(`
@@ -13007,7 +13579,7 @@ function formatStartTime(hour, minute) {
   return `${pad2(hour)}:${pad2(minute)}`;
 }
 function windowsTaskBaseName(job) {
-  const scopeId = job.scopeId || deriveScopeId(job.workdir || homedir());
+  const scopeId = job.scopeId || deriveScopeId(job.workdir || homedir3());
   return `${WINDOWS_TASK_PREFIX}-${scopeId}-${job.slug}`;
 }
 function windowsTaskName(baseName, index, total) {
@@ -13125,7 +13697,7 @@ function cronToWindowsTaskDefinitions(job) {
   });
 }
 function createLaunchdPlist(job) {
-  const scopeId = job.scopeId || deriveScopeId(job.workdir || homedir());
+  const scopeId = job.scopeId || deriveScopeId(job.workdir || homedir3());
   const label = `${LAUNCHD_PREFIX}.${scopeId}.${job.slug}`;
   const logFilePath = scopedLogPath(scopeId, job.slug);
   const jobPath = jobFilePath(scopeId, job.slug);
@@ -13144,8 +13716,9 @@ ${renderLaunchdCalendar(calendar)}
     `    <string>${escapePlistString(jobPath)}</string>`
   ].join(`
 `);
-  const workdir = job.workdir || homedir();
+  const workdir = job.workdir || homedir3();
   const enhancedPath = getEnhancedPath();
+  const envDict = renderLaunchdEnvDict(job, enhancedPath);
   return `<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
@@ -13158,8 +13731,7 @@ ${renderLaunchdCalendar(calendar)}
   
   <key>EnvironmentVariables</key>
   <dict>
-    <key>PATH</key>
-    <string>${enhancedPath}</string>
+${envDict}
   </dict>
   
   <key>ProgramArguments</key>
@@ -13184,48 +13756,49 @@ ${calendarXml}
 function installLaunchdJob(job) {
   ensureDir(LAUNCH_AGENTS_DIR);
   ensureDir(LOGS_DIR);
-  const scopeId = job.scopeId || deriveScopeId(job.workdir || homedir());
+  const scopeId = job.scopeId || deriveScopeId(job.workdir || homedir3());
   ensureDir(scopeLogsDir(scopeId));
   ensureSupervisorScript();
   const legacyLabel = `${LAUNCHD_PREFIX}.${job.slug}`;
-  const legacyPlistPath = join(LAUNCH_AGENTS_DIR, `${legacyLabel}.plist`);
+  const legacyPlistPath = join3(LAUNCH_AGENTS_DIR, `${legacyLabel}.plist`);
   const label = `${LAUNCHD_PREFIX}.${scopeId}.${job.slug}`;
-  const plistPath = join(LAUNCH_AGENTS_DIR, `${label}.plist`);
+  const plistPath = join3(LAUNCH_AGENTS_DIR, `${label}.plist`);
   try {
     execSync(`launchctl unload "${plistPath}" 2>/dev/null`, { stdio: "ignore" });
   } catch {}
-  if (existsSync(legacyPlistPath)) {
+  if (existsSync3(legacyPlistPath)) {
     try {
       execSync(`launchctl unload "${legacyPlistPath}" 2>/dev/null`, { stdio: "ignore" });
     } catch {}
   }
   const plist = createLaunchdPlist(job);
-  writeFileSync(plistPath, plist);
+  writeFileSync2(plistPath, plist);
   execSync(`launchctl load "${plistPath}"`);
 }
 function uninstallLaunchdJob(job) {
-  const scopeId = job.scopeId || deriveScopeId(job.workdir || homedir());
+  const scopeId = job.scopeId || deriveScopeId(job.workdir || homedir3());
   const scopedLabel = `${LAUNCHD_PREFIX}.${scopeId}.${job.slug}`;
-  const scopedPlistPath = join(LAUNCH_AGENTS_DIR, `${scopedLabel}.plist`);
+  const scopedPlistPath = join3(LAUNCH_AGENTS_DIR, `${scopedLabel}.plist`);
   const legacyLabel = `${LAUNCHD_PREFIX}.${job.slug}`;
-  const legacyPlistPath = join(LAUNCH_AGENTS_DIR, `${legacyLabel}.plist`);
+  const legacyPlistPath = join3(LAUNCH_AGENTS_DIR, `${legacyLabel}.plist`);
   for (const plistPath of [scopedPlistPath, legacyPlistPath]) {
-    if (!existsSync(plistPath))
+    if (!existsSync3(plistPath))
       continue;
     try {
       execSync(`launchctl unload "${plistPath}"`, { stdio: "ignore" });
     } catch {}
     try {
-      unlinkSync(plistPath);
+      unlinkSync2(plistPath);
     } catch {}
   }
 }
 function createSystemdService(job) {
-  const scopeId = job.scopeId || deriveScopeId(job.workdir || homedir());
+  const scopeId = job.scopeId || deriveScopeId(job.workdir || homedir3());
   const logFilePath = scopedLogPath(scopeId, job.slug);
   const jobPath = jobFilePath(scopeId, job.slug);
-  const workdir = job.workdir || homedir();
+  const workdir = job.workdir || homedir3();
   const enhancedPath = getEnhancedPath();
+  const envLines = renderSystemdEnvLines(job, enhancedPath);
   const execStart = ["/usr/bin/perl", SUPERVISOR_PATH, jobPath].map((arg) => `"${escapeSystemdArg(arg)}"`).join(" ");
   return `[Unit]
 Description=OpenCode Job: ${job.name}
@@ -13233,7 +13806,7 @@ Description=OpenCode Job: ${job.name}
 [Service]
 Type=oneshot
 WorkingDirectory=${workdir}
-Environment="PATH=${enhancedPath}"
+${envLines}
 ExecStart=${execStart}
 StandardOutput=append:${logFilePath}
 StandardError=append:${logFilePath}
@@ -13260,23 +13833,23 @@ WantedBy=timers.target
 function installSystemdJob(job) {
   ensureDir(SYSTEMD_USER_DIR);
   ensureDir(LOGS_DIR);
-  const scopeId = job.scopeId || deriveScopeId(job.workdir || homedir());
+  const scopeId = job.scopeId || deriveScopeId(job.workdir || homedir3());
   ensureDir(scopeLogsDir(scopeId));
   ensureSupervisorScript();
-  const servicePath = join(SYSTEMD_USER_DIR, `opencode-job-${scopeId}-${job.slug}.service`);
-  const timerPath = join(SYSTEMD_USER_DIR, `opencode-job-${scopeId}-${job.slug}.timer`);
+  const servicePath = join3(SYSTEMD_USER_DIR, `opencode-job-${scopeId}-${job.slug}.service`);
+  const timerPath = join3(SYSTEMD_USER_DIR, `opencode-job-${scopeId}-${job.slug}.timer`);
   try {
     execSync(`systemctl --user stop opencode-job-${job.slug}.timer`, { stdio: "ignore" });
     execSync(`systemctl --user disable opencode-job-${job.slug}.timer`, { stdio: "ignore" });
   } catch {}
-  writeFileSync(servicePath, createSystemdService(job));
-  writeFileSync(timerPath, createSystemdTimer(job));
+  writeFileSync2(servicePath, createSystemdService(job));
+  writeFileSync2(timerPath, createSystemdTimer(job));
   execSync("systemctl --user daemon-reload");
   execSync(`systemctl --user enable opencode-job-${scopeId}-${job.slug}.timer`);
   execSync(`systemctl --user start opencode-job-${scopeId}-${job.slug}.timer`);
 }
 function uninstallSystemdJob(job) {
-  const scopeId = job.scopeId || deriveScopeId(job.workdir || homedir());
+  const scopeId = job.scopeId || deriveScopeId(job.workdir || homedir3());
   const scopedTimerUnit = `opencode-job-${scopeId}-${job.slug}.timer`;
   const legacyTimerUnit = `opencode-job-${job.slug}.timer`;
   for (const timerUnit of [scopedTimerUnit, legacyTimerUnit]) {
@@ -13285,14 +13858,14 @@ function uninstallSystemdJob(job) {
       execSync(`systemctl --user disable ${timerUnit}`, { stdio: "ignore" });
     } catch {}
   }
-  const scopedServicePath = join(SYSTEMD_USER_DIR, `opencode-job-${scopeId}-${job.slug}.service`);
-  const scopedTimerPath = join(SYSTEMD_USER_DIR, `opencode-job-${scopeId}-${job.slug}.timer`);
-  const legacyServicePath = join(SYSTEMD_USER_DIR, `opencode-job-${job.slug}.service`);
-  const legacyTimerPath = join(SYSTEMD_USER_DIR, `opencode-job-${job.slug}.timer`);
+  const scopedServicePath = join3(SYSTEMD_USER_DIR, `opencode-job-${scopeId}-${job.slug}.service`);
+  const scopedTimerPath = join3(SYSTEMD_USER_DIR, `opencode-job-${scopeId}-${job.slug}.timer`);
+  const legacyServicePath = join3(SYSTEMD_USER_DIR, `opencode-job-${job.slug}.service`);
+  const legacyTimerPath = join3(SYSTEMD_USER_DIR, `opencode-job-${job.slug}.timer`);
   for (const p of [scopedServicePath, scopedTimerPath, legacyServicePath, legacyTimerPath]) {
-    if (existsSync(p)) {
+    if (existsSync3(p)) {
       try {
-        unlinkSync(p);
+        unlinkSync2(p);
       } catch {}
     }
   }
@@ -13354,7 +13927,7 @@ function isCronAvailable() {
   return isCommandAvailable("crontab");
 }
 function cronBlockId(job) {
-  const scopeId = job.scopeId || deriveScopeId(job.workdir || homedir());
+  const scopeId = job.scopeId || deriveScopeId(job.workdir || homedir3());
   return `${scopeId}:${job.slug}`;
 }
 function cronLegacyBlockId(job) {
@@ -13427,21 +14000,21 @@ function stripManagedCronBlocks(content, blockIds) {
   };
 }
 function createCronEntry(job) {
-  const scopeId = job.scopeId || deriveScopeId(job.workdir || homedir());
+  const scopeId = job.scopeId || deriveScopeId(job.workdir || homedir3());
   const jobPath = jobFilePath(scopeId, job.slug);
   const logFilePath = scopedLogPath(scopeId, job.slug);
   const escapedSupervisor = shellEscapeDoubleQuoted(SUPERVISOR_PATH);
   const escapedJobPath = shellEscapeDoubleQuoted(jobPath);
   const escapedLogPath = shellEscapeDoubleQuoted(logFilePath);
-  const escapedPath = shellEscapeDoubleQuoted(getEnhancedPath());
-  return `${job.schedule} PATH="${escapedPath}" /usr/bin/perl "${escapedSupervisor}" "${escapedJobPath}" >> "${escapedLogPath}" 2>&1`;
+  const envPreamble = renderCronEnvPreamble(job, getEnhancedPath());
+  return `${job.schedule} ${envPreamble} /usr/bin/perl "${escapedSupervisor}" "${escapedJobPath}" >> "${escapedLogPath}" 2>&1`;
 }
 function installCronJob(job) {
   if (!isCronAvailable()) {
     throw new Error("cron backend is unavailable: `crontab` command not found.");
   }
   ensureDir(LOGS_DIR);
-  const scopeId = job.scopeId || deriveScopeId(job.workdir || homedir());
+  const scopeId = job.scopeId || deriveScopeId(job.workdir || homedir3());
   ensureDir(scopeLogsDir(scopeId));
   ensureSupervisorScript();
   const blockId = cronBlockId(job);
@@ -13517,28 +14090,28 @@ function uninstallJob(job) {
 function ensureScopeStorage(scopeId) {
   ensureDir(SCHEDULER_DIR);
   ensureDir(SCOPES_DIR);
-  ensureDir(scopeJobsDir(scopeId));
-  ensureDir(scopeLocksDir(scopeId));
-  ensureDir(scopeRunsDir(scopeId));
+  ensureDirUserOnly(scopeJobsDir(scopeId));
+  ensureDirUserOnly(scopeLocksDir(scopeId));
+  ensureDirUserOnly(scopeRunsDir(scopeId));
   ensureDir(scopeLogsDir(scopeId));
 }
 function loadScopedJob(scopeId, slug) {
   ensureScopeStorage(scopeId);
   const path = jobFilePath(scopeId, slug);
-  if (!existsSync(path))
+  if (!existsSync3(path))
     return null;
   try {
-    return normalizeJob(JSON.parse(readFileSync(path, "utf-8")));
+    return normalizeJob(JSON.parse(readFileSync3(path, "utf-8")));
   } catch {
     return null;
   }
 }
 function loadAllScopedJobs(scopeId) {
   ensureScopeStorage(scopeId);
-  const files = readdirSync(scopeJobsDir(scopeId)).filter((f) => f.endsWith(".json"));
+  const files = readdirSync2(scopeJobsDir(scopeId)).filter((f) => f.endsWith(".json"));
   return files.map((f) => {
     try {
-      return normalizeJob(JSON.parse(readFileSync(join(scopeJobsDir(scopeId), f), "utf-8")));
+      return normalizeJob(JSON.parse(readFileSync3(join3(scopeJobsDir(scopeId), f), "utf-8")));
     } catch {
       return null;
     }
@@ -13547,9 +14120,9 @@ function loadAllScopedJobs(scopeId) {
 function listScopeIds() {
   ensureDir(SCOPES_DIR);
   try {
-    return readdirSync(SCOPES_DIR).filter((name) => {
+    return readdirSync2(SCOPES_DIR).filter((name) => {
       try {
-        return existsSync(scopeDir(name));
+        return existsSync3(scopeDir(name));
       } catch {
         return false;
       }
@@ -13568,55 +14141,55 @@ function loadAllJobsAcrossScopes() {
 }
 function loadLegacyJob(slug) {
   ensureDir(LEGACY_JOBS_DIR);
-  const path = join(LEGACY_JOBS_DIR, `${slug}.json`);
-  if (!existsSync(path))
+  const path = join3(LEGACY_JOBS_DIR, `${slug}.json`);
+  if (!existsSync3(path))
     return null;
   try {
-    return normalizeJob(JSON.parse(readFileSync(path, "utf-8")));
+    return normalizeJob(JSON.parse(readFileSync3(path, "utf-8")));
   } catch {
     return null;
   }
 }
 function loadAllLegacyJobs() {
   ensureDir(LEGACY_JOBS_DIR);
-  const files = readdirSync(LEGACY_JOBS_DIR).filter((f) => f.endsWith(".json"));
+  const files = readdirSync2(LEGACY_JOBS_DIR).filter((f) => f.endsWith(".json"));
   return files.map((f) => {
     try {
-      return normalizeJob(JSON.parse(readFileSync(join(LEGACY_JOBS_DIR, f), "utf-8")));
+      return normalizeJob(JSON.parse(readFileSync3(join3(LEGACY_JOBS_DIR, f), "utf-8")));
     } catch {
       return null;
     }
   }).filter(Boolean);
 }
 function saveJob(job) {
-  const scopeId = job.scopeId || deriveScopeId(job.workdir || homedir());
+  const scopeId = job.scopeId || deriveScopeId(job.workdir || homedir3());
   const normalizedJob = { ...job, scopeId };
   ensureScopeStorage(scopeId);
   const path = jobFilePath(scopeId, normalizedJob.slug);
-  writeFileSync(path, JSON.stringify(sanitizeJob(normalizedJob), null, 2));
+  writeFileUserOnly(path, JSON.stringify(sanitizeJob(normalizedJob), null, 2));
 }
 function deleteJobFile(job) {
-  const scopeId = job.scopeId || deriveScopeId(job.workdir || homedir());
+  const scopeId = job.scopeId || deriveScopeId(job.workdir || homedir3());
   const path = jobFilePath(scopeId, job.slug);
-  if (existsSync(path)) {
-    unlinkSync(path);
+  if (existsSync3(path)) {
+    unlinkSync2(path);
   }
 }
 function listDirectoryFiles(dir, options) {
-  if (!existsSync(dir))
+  if (!existsSync3(dir))
     return [];
   try {
-    const entries = readdirSync(dir, { withFileTypes: true });
-    return entries.filter((entry) => entry.isFile()).map((entry) => entry.name).filter((name) => options?.prefix ? name.startsWith(options.prefix) : true).filter((name) => options?.suffix ? name.endsWith(options.suffix) : true).map((name) => join(dir, name)).sort();
+    const entries = readdirSync2(dir, { withFileTypes: true });
+    return entries.filter((entry) => entry.isFile()).map((entry) => entry.name).filter((name) => options?.prefix ? name.startsWith(options.prefix) : true).filter((name) => options?.suffix ? name.endsWith(options.suffix) : true).map((name) => join3(dir, name)).sort();
   } catch {
     return [];
   }
 }
 function listDirectoryNames(dir) {
-  if (!existsSync(dir))
+  if (!existsSync3(dir))
     return [];
   try {
-    return readdirSync(dir, { withFileTypes: true }).filter((entry) => entry.isDirectory()).map((entry) => entry.name).sort();
+    return readdirSync2(dir, { withFileTypes: true }).filter((entry) => entry.isDirectory()).map((entry) => entry.name).sort();
   } catch {
     return [];
   }
@@ -13629,9 +14202,9 @@ function buildGlobalCleanupPlan(includeHistory) {
   const scopedJobDefinitionPaths = scopeIds.flatMap((scopeId) => listDirectoryFiles(scopeJobsDir(scopeId), { suffix: ".json" }));
   const lockPaths = scopeIds.flatMap((scopeId) => listDirectoryFiles(scopeLocksDir(scopeId), { suffix: ".json" }));
   const runHistoryPaths = includeHistory ? scopeIds.flatMap((scopeId) => listDirectoryFiles(scopeRunsDir(scopeId), { suffix: ".jsonl" })) : [];
-  const schedulerLogsRoot = join(LOGS_DIR, "scheduler");
+  const schedulerLogsRoot = join3(LOGS_DIR, "scheduler");
   const logScopeIds = listDirectoryNames(schedulerLogsRoot);
-  const logPaths = includeHistory ? logScopeIds.flatMap((scopeId) => listDirectoryFiles(join(schedulerLogsRoot, scopeId), { suffix: ".log" })) : [];
+  const logPaths = includeHistory ? logScopeIds.flatMap((scopeId) => listDirectoryFiles(join3(schedulerLogsRoot, scopeId), { suffix: ".log" })) : [];
   const launchdPaths = IS_MAC ? listDirectoryFiles(LAUNCH_AGENTS_DIR, { prefix: `${LAUNCHD_PREFIX}.`, suffix: ".plist" }) : [];
   const systemdPaths = IS_LINUX ? [
     ...listDirectoryFiles(SYSTEMD_USER_DIR, { prefix: "opencode-job-", suffix: ".service" }),
@@ -13653,7 +14226,7 @@ function buildGlobalCleanupPlan(includeHistory) {
 function removePaths(paths, errors3) {
   const removed = [];
   for (const path of uniquePaths(paths)) {
-    if (!existsSync(path))
+    if (!existsSync3(path))
       continue;
     try {
       rmSync(path, { recursive: true, force: true });
@@ -13680,7 +14253,7 @@ function executeGlobalCleanup(plan, options) {
   }
   const removeOrPreview = (paths) => {
     if (dryRun)
-      return uniquePaths(paths).filter((path) => existsSync(path));
+      return uniquePaths(paths).filter((path) => existsSync3(path));
     return removePaths(paths, errors3);
   };
   const removed = {
@@ -13738,6 +14311,68 @@ function formatGlobalCleanupOutput(execution) {
   return lines.join(`
 `);
 }
+var SESSION_POLICY_REQUIRED_MESSAGE = "sessionPolicy is required. Pick one: 'current' (continue this chat), 'existing' (write into a specific session \u2014 supply sessionId), 'new-per-job' (one fresh session reused forever), 'new-per-run' (a fresh session every fire). Ask the user which one fits their intent \u2014 do not guess.";
+function parseSessionPolicy(raw) {
+  if (raw === undefined || raw === null) {
+    throw new Error(SESSION_POLICY_REQUIRED_MESSAGE);
+  }
+  if (typeof raw !== "string") {
+    throw new Error("sessionPolicy must be a string");
+  }
+  const trimmed = raw.trim();
+  if (!trimmed) {
+    throw new Error(SESSION_POLICY_REQUIRED_MESSAGE);
+  }
+  if (trimmed === "current" || trimmed === "existing" || trimmed === "new-per-job" || trimmed === "new-per-run") {
+    return trimmed;
+  }
+  throw new Error(`Invalid sessionPolicy: ${trimmed} (expected: current | existing | new-per-job | new-per-run)`);
+}
+function getEffectiveSessionPolicy(job) {
+  return job.sessionPolicy ?? "current";
+}
+function parseExecutionPolicy(raw) {
+  if (raw === undefined || raw === null)
+    return "prefer-live-server";
+  if (typeof raw !== "string") {
+    throw new Error("executionPolicy must be a string");
+  }
+  const trimmed = raw.trim();
+  if (!trimmed)
+    return "prefer-live-server";
+  if (trimmed === "prefer-live-server" || trimmed === "headless-only")
+    return trimmed;
+  throw new Error(`Invalid executionPolicy: ${trimmed} (expected: prefer-live-server | headless-only)`);
+}
+function parseDeliveryPolicy(raw) {
+  if (raw === undefined || raw === null)
+    return "execute";
+  if (typeof raw !== "string") {
+    throw new Error("deliveryPolicy must be a string");
+  }
+  const trimmed = raw.trim();
+  if (!trimmed)
+    return "execute";
+  if (trimmed === "execute" || trimmed === "leave-message")
+    return trimmed;
+  throw new Error(`Invalid deliveryPolicy: ${trimmed} (expected: execute | leave-message)`);
+}
+function validateSessionPolicyArgs(input) {
+  const sid = (input.sessionId ?? "").trim();
+  if (input.sessionPolicy === "current") {
+    const fallback = (input.toolSessionID ?? "").trim();
+    if (!sid && !fallback) {
+      return "sessionPolicy='current' requires a session context (run from inside an opencode session) or pass sessionId explicitly.";
+    }
+  }
+  if (input.sessionPolicy === "existing" && !sid) {
+    return "sessionPolicy='existing' requires sessionId.";
+  }
+  if (input.executionPolicy === "headless-only" && input.attachUrl) {
+    return "executionPolicy='headless-only' is incompatible with attachUrl. Drop attachUrl or use executionPolicy='prefer-live-server'.";
+  }
+  return;
+}
 function normalizeAttachUrl(attachUrl) {
   if (attachUrl === undefined)
     return;
@@ -13750,6 +14385,181 @@ function normalizeAttachUrl(attachUrl) {
     throw new Error(`Invalid attach URL: ${attachUrl}`);
   }
   return trimmed;
+}
+var INTERNAL_SERVER_HOSTNAME = "opencode.internal";
+function isInternalServerUrl(serverUrl) {
+  try {
+    const url2 = typeof serverUrl === "string" ? new URL(serverUrl) : serverUrl;
+    return url2.hostname === INTERNAL_SERVER_HOSTNAME;
+  } catch {
+    return false;
+  }
+}
+function resolveEffectiveAttachUrl(input) {
+  if (input.argAttachUrl && input.argAttachUrl.trim()) {
+    return {
+      attachUrl: normalizeAttachUrl(input.argAttachUrl),
+      autoFromServerUrl: false,
+      internalWarning: false
+    };
+  }
+  if (input.executionPolicy === "headless-only") {
+    return { attachUrl: undefined, autoFromServerUrl: false, internalWarning: false };
+  }
+  const serverUrlString = typeof input.serverUrl === "string" ? input.serverUrl : input.serverUrl.toString();
+  if (isInternalServerUrl(input.serverUrl)) {
+    const routesToCallingTui = input.sessionPolicy === "current" || input.sessionPolicy === "existing";
+    return {
+      attachUrl: undefined,
+      autoFromServerUrl: false,
+      internalWarning: routesToCallingTui
+    };
+  }
+  return {
+    attachUrl: normalizeAttachUrl(serverUrlString),
+    autoFromServerUrl: true,
+    internalWarning: false
+  };
+}
+function buildOwnRegistryEntry(input) {
+  if (isInternalServerUrl(input.serverUrl))
+    return;
+  const url2 = typeof input.serverUrl === "string" ? new URL(input.serverUrl) : input.serverUrl;
+  const portStr = url2.port || (url2.protocol === "https:" ? "443" : "80");
+  const port = Number.parseInt(portStr, 10);
+  if (!Number.isFinite(port) || port < 0)
+    return;
+  return {
+    schemaVersion: REGISTRY_SCHEMA_VERSION,
+    pid: input.pid ?? process.pid,
+    port,
+    url: url2.toString(),
+    workdir: input.workdir ?? process.cwd(),
+    startedAt: input.startedAt ?? new Date().toISOString(),
+    agent: input.agent
+  };
+}
+function initRegistryForPlugin(input) {
+  let sweepRemoved = 0;
+  try {
+    sweepRemoved = sweepStaleEntries(input.registryDir).removed;
+  } catch {}
+  const entry = buildOwnRegistryEntry({
+    serverUrl: input.serverUrl,
+    workdir: input.workdir,
+    agent: input.agent
+  });
+  if (!entry)
+    return { sweepRemoved };
+  try {
+    writeRegistryEntry(entry, input.registryDir ?? undefined);
+  } catch {
+    return { sweepRemoved };
+  }
+  if (!REGISTRY_EXIT_HANDLERS_INSTALLED.has(entry.pid)) {
+    REGISTRY_EXIT_HANDLERS_INSTALLED.add(entry.pid);
+    const cleanup = () => {
+      try {
+        removeRegistryEntry(entry.pid, input.registryDir ?? undefined);
+      } catch {}
+    };
+    process.once("exit", cleanup);
+    const signalHandler = (signal) => {
+      cleanup();
+      process.kill(process.pid, signal);
+    };
+    process.once("SIGINT", signalHandler);
+    process.once("SIGTERM", signalHandler);
+  }
+  return { entry, sweepRemoved };
+}
+var REGISTRY_EXIT_HANDLERS_INSTALLED = new Set;
+function formatInstallServerConfigResult(result) {
+  if (result.ok && result.status === "preview") {
+    return [
+      `Preview only \u2014 nothing written.`,
+      `Config: ${result.configPath}`,
+      `Plan: ${result.plan.diff}`,
+      ``,
+      `Call install_server_config again with confirm: true to apply this change.`,
+      result.plan.action.kind === "overwrite-port" ? `Also pass overwrite: true (current server.port = ${result.plan.action.previous}).` : ``
+    ].filter(Boolean).join(`
+`);
+  }
+  if (result.ok && result.status === "noop") {
+    return [
+      `No change needed.`,
+      `Config: ${result.configPath}`,
+      result.plan.diff
+    ].join(`
+`);
+  }
+  if (result.ok && result.status === "written") {
+    return [
+      `Wrote ${result.configPath}.`,
+      `Change: ${result.plan.diff}`,
+      ``,
+      `Restart opencode for server.port to take effect (read at startup, not live-reloaded).`
+    ].join(`
+`);
+  }
+  if (!result.ok && result.status === "needs-overwrite") {
+    const action = result.plan.action.kind === "overwrite-port" ? result.plan.action : null;
+    const previous = action ? action.previous : "(unknown)";
+    const next = action ? action.next : "(unknown)";
+    return [
+      `Refusing to overwrite an existing different value.`,
+      `Config: ${result.configPath}`,
+      `Current server.port = ${previous}; requested = ${next}.`,
+      ``,
+      `Pass overwrite: true (and confirm: true) to replace it.`
+    ].join(`
+`);
+  }
+  if (!result.ok && result.status === "invalid-port") {
+    return `Invalid port: ${result.reason}`;
+  }
+  if (!result.ok && result.status === "read-error") {
+    return `Failed to read config at ${result.configPath}: ${result.reason}`;
+  }
+  if (!result.ok && result.status === "plan-error") {
+    return `Cannot plan config update for ${result.configPath}: ${result.reason}`;
+  }
+  return `Failed to write config at ${"configPath" in result ? result.configPath : "(unknown)"}: ${"reason" in result ? result.reason : "(unknown)"}`;
+}
+function buildInternalServerWarning() {
+  return [
+    "WARNING: this opencode is running without an external HTTP port (serverUrl is http://opencode.internal/...).",
+    "Scheduled runs will deliver via headless opencode: messages land in storage immediately, but the open TUI",
+    "will NOT refresh until you re-open the session. To get live in-TUI delivery, restart opencode with",
+    "`--port 0` (OS-assigned random port) or `--port N`, then re-create the job \u2014 the plugin will auto-detect",
+    "the new serverUrl and attach to it. Once the upstream Zod fix lands you can also set `server.port: 0` in",
+    "`~/.config/opencode/opencode.json` and skip the CLI flag."
+  ].join(" ");
+}
+function formatScheduleJobSuccess(input) {
+  const attachLine = input.attachUrl ? input.attachUrlAutoFromServerUrl ? `Attach URL: ${input.attachUrl} (auto-detected from this opencode's serverUrl; pass attachUrl explicitly to override)
+` : `Attach URL: ${input.attachUrl}
+` : "";
+  const internalWarningBlock = input.internalWarning ? `
+${buildInternalServerWarning()}
+` : "";
+  const skillLine = input.skillEnsure.status === "installed" ? `
+Installed scheduled-job-best-practices skill at ${input.skillEnsure.path}` : input.skillEnsure.status === "failed" ? `
+Note: could not install scheduled-job-best-practices skill (${input.skillEnsure.reason}); add it manually with install_skill` : "";
+  return `Scheduled "${input.name}"
+
+Schedule: ${input.schedule} (${input.scheduleHuman})
+Platform: ${input.platformName}
+Working Directory: ${input.workdir}
+${attachLine}${input.primaryLine}${skillLine}
+${internalWarningBlock}
+${input.reliabilityLine}
+
+Commands:
+- "run ${input.name} now" - run immediately
+- "show my jobs" - list all
+- "delete job ${input.name}" - remove`;
 }
 function isRecord(value) {
   return typeof value === "object" && value !== null && !Array.isArray(value);
@@ -13882,7 +14692,7 @@ function sanitizeJob(job) {
     sanitized.scopeId = trimmed ? trimmed : undefined;
   }
   if (!sanitized.scopeId) {
-    sanitized.scopeId = deriveScopeId(sanitized.workdir || homedir());
+    sanitized.scopeId = deriveScopeId(sanitized.workdir || homedir3());
   }
   if (sanitized.timeoutSeconds !== undefined) {
     const n = sanitized.timeoutSeconds;
@@ -14002,7 +14812,40 @@ function normalizeJob(raw) {
   const inv = normalizeJobInvocation(raw.invocation);
   if (inv)
     job.invocation = inv;
+  const env = normalizeJobEnv(raw.env);
+  if (env)
+    job.env = env;
+  if (raw.sessionPolicy === "current" || raw.sessionPolicy === "existing" || raw.sessionPolicy === "new-per-job" || raw.sessionPolicy === "new-per-run") {
+    job.sessionPolicy = raw.sessionPolicy;
+  }
+  if (raw.executionPolicy === "prefer-live-server" || raw.executionPolicy === "headless-only") {
+    job.executionPolicy = raw.executionPolicy;
+  }
+  if (raw.deliveryPolicy === "execute" || raw.deliveryPolicy === "leave-message") {
+    job.deliveryPolicy = raw.deliveryPolicy;
+  }
+  const headlessInv = normalizeJobInvocation(raw.headlessInvocation);
+  if (headlessInv)
+    job.headlessInvocation = headlessInv;
   return sanitizeJob(job);
+}
+function normalizeJobEnv(raw) {
+  if (!isRecord(raw))
+    return;
+  const mode = raw.mode;
+  if (mode !== "snapshot" && mode !== "minimal" && mode !== "login-shell")
+    return;
+  const result = { mode };
+  if (isRecord(raw.snapshot)) {
+    const snapshot = {};
+    for (const [key, value] of Object.entries(raw.snapshot)) {
+      if (typeof value === "string")
+        snapshot[key] = value;
+    }
+    if (Object.keys(snapshot).length > 0)
+      result.snapshot = snapshot;
+  }
+  return result;
 }
 function findJobByName(name, options) {
   const scopeId = options?.scopeId ?? currentScopeId();
@@ -14026,7 +14869,7 @@ function findJobByName(name, options) {
   return job;
 }
 function updateJobRecord(job, updates) {
-  const scopeId = job.scopeId || deriveScopeId(job.workdir || homedir());
+  const scopeId = job.scopeId || deriveScopeId(job.workdir || homedir3());
   const latest = loadScopedJob(scopeId, job.slug) || job;
   const updated = {
     ...latest,
@@ -14038,15 +14881,27 @@ function updateJobRecord(job, updates) {
   return updated;
 }
 function getLogPath(job) {
-  const scopeId = job.scopeId || deriveScopeId(job.workdir || homedir());
+  const scopeId = job.scopeId || deriveScopeId(job.workdir || homedir3());
   return scopedLogPath(scopeId, job.slug);
 }
-function buildOpencodeArgs(job) {
+function buildOpencodeArgs(job, options) {
+  const inner = buildOpencodeArgsInner(job, options);
+  if (job.env?.mode === "login-shell" && !IS_WINDOWS) {
+    const shell = (process.env.SHELL ?? "").trim() || "/bin/bash";
+    const flat = [inner.command, ...inner.args].map(shellEscapeSingleQuoted).join(" ");
+    return { command: shell, args: ["-lic", flat] };
+  }
+  return inner;
+}
+function shellEscapeSingleQuoted(value) {
+  return `'${value.replace(/'/g, `'\\''`)}'`;
+}
+function buildOpencodeArgsInner(job, options) {
   const command = findOpencode();
   const run = normalizeRunSpec(getJobRun(job));
   validateRunSpec(run);
   const args = ["run"];
-  if (run.attachUrl) {
+  if (run.attachUrl && options?.withAttachUrl !== false) {
     args.push("--attach", run.attachUrl);
   }
   if (run.port !== undefined) {
@@ -14087,9 +14942,7 @@ function buildOpencodeArgs(job) {
   return { command, args };
 }
 function buildRunEnvironment() {
-  const enhancedPath = getEnhancedPath();
-  const existingPath = process.env.PATH;
-  const combinedPath = existingPath ? `${enhancedPath}:${existingPath}` : enhancedPath;
+  const combinedPath = getEnhancedPath({ withTerminalPath: true });
   const basePolicy = { question: "deny" };
   const mergedPolicy = (() => {
     const raw = process.env.OPENCODE_PERMISSION;
@@ -14103,38 +14956,50 @@ function buildRunEnvironment() {
     } catch {}
     return basePolicy;
   })();
-  const baseEnv = { ...process.env };
   const config2 = loadSchedulerConfig();
-  const preserveOpencodeEnv = config2.env?.preserveOpencodeEnv === true;
-  const preserved = new Set(["OPENCODE_PERMISSION", ...config2.env?.preserve ?? []]);
-  if (!preserveOpencodeEnv) {
-    for (const key of Object.keys(baseEnv)) {
-      if (!key.startsWith("OPENCODE_"))
-        continue;
-      if (key.startsWith("OPENCODE_SCHEDULER_"))
-        continue;
-      if (preserved.has(key))
-        continue;
-      delete baseEnv[key];
-    }
-  }
   return {
-    ...baseEnv,
+    ...process.env,
     ...config2.env?.set,
     PATH: combinedPath,
     OPENCODE_PERMISSION: JSON.stringify(mergedPolicy)
   };
 }
 function loadSchedulerConfig() {
-  if (!existsSync(SCHEDULER_CONFIG))
+  if (!existsSync3(SCHEDULER_CONFIG))
     return {};
   try {
-    const raw = readFileSync(SCHEDULER_CONFIG, "utf-8");
+    const raw = readFileSync3(SCHEDULER_CONFIG, "utf-8");
     const parsed = JSON.parse(raw);
     if (!isRecord(parsed))
       return {};
+    const env = isRecord(parsed.env) ? parsed.env : undefined;
+    if (env) {
+      const legacy = [];
+      if ("preserve" in env)
+        legacy.push("env.preserve");
+      if ("preserveOpencodeEnv" in env)
+        legacy.push("env.preserveOpencodeEnv");
+      if (legacy.length > 0)
+        warnLegacyEnvKeysOnce(legacy);
+      if ("mode" in env) {
+        const mode = env.mode;
+        if (mode !== "snapshot" && mode !== "minimal" && mode !== "login-shell") {
+          throw new Error(`Invalid env.mode in ${SCHEDULER_CONFIG}: ${String(mode)} (expected: snapshot | minimal | login-shell)`);
+        }
+      }
+      if (isRecord(env.set)) {
+        for (const key of Object.keys(env.set)) {
+          if (ENV_DENYLIST_INTERNAL.has(key)) {
+            throw new Error(`Invalid env.set in ${SCHEDULER_CONFIG}: '${key}' is reserved by the scheduler and cannot be set.`);
+          }
+        }
+      }
+    }
     return parsed;
-  } catch {
+  } catch (error45) {
+    if (error45 instanceof Error && /Invalid env\./.test(error45.message)) {
+      throw error45;
+    }
     return {};
   }
 }
@@ -14148,11 +15013,11 @@ function getOpencodeVersion(opencodePath) {
 }
 function runJobNow(job) {
   ensureDir(LOGS_DIR);
-  ensureDir(scopeLogsDir(job.scopeId || deriveScopeId(job.workdir || homedir())));
+  ensureDir(scopeLogsDir(job.scopeId || deriveScopeId(job.workdir || homedir3())));
   const startedAt = new Date().toISOString();
   const logPath = getLogPath(job);
   const logStream = createWriteStream(logPath, { flags: "a" });
-  const workdir = job.workdir || homedir();
+  const workdir = job.workdir || homedir3();
   logStream.write(`
 === Manual run ${startedAt} ===
 `);
@@ -14252,7 +15117,7 @@ function formatJobDetails(job) {
     `Job: ${job.name}`,
     `Slug: ${job.slug}`,
     `Schedule: ${job.schedule} (${describeCron(job.schedule)})`,
-    `Working Directory: ${job.workdir || homedir()}`
+    `Working Directory: ${job.workdir || homedir3()}`
   ];
   const run = (() => {
     try {
@@ -14303,6 +15168,13 @@ function formatJobDetails(job) {
   if (run?.session) {
     lines.push(`Session: ${run.session}`);
   }
+  lines.push(`Session Policy: ${getEffectiveSessionPolicy(job)}`);
+  if (job.executionPolicy) {
+    lines.push(`Execution Policy: ${job.executionPolicy}`);
+  }
+  if (job.deliveryPolicy) {
+    lines.push(`Delivery Policy: ${job.deliveryPolicy}`);
+  }
   if (run?.port !== undefined) {
     lines.push(`Port: ${run.port}`);
   }
@@ -14330,7 +15202,7 @@ function formatJobDetails(job) {
 }
 function getJobLogs(job, options) {
   const logPath = getLogPath(job);
-  if (!existsSync(logPath))
+  if (!existsSync3(logPath))
     return null;
   const maxChars = options?.maxChars ?? 5000;
   const tailLines = options?.tailLines;
@@ -14343,24 +15215,103 @@ function getJobLogs(job, options) {
         }).toString();
         return output.length > maxChars ? output.slice(-maxChars) : output;
       } catch {
-        const content2 = readFileSync(logPath, "utf-8");
+        const content2 = readFileSync3(logPath, "utf-8");
         const lines = content2.split(/\r?\n/);
         const output = lines.slice(-clampedLines).join(`
 `);
         return output.length > maxChars ? output.slice(-maxChars) : output;
       }
     }
-    const content = readFileSync(logPath, "utf-8");
+    const content = readFileSync3(logPath, "utf-8");
     return content.length > maxChars ? content.slice(-maxChars) : content;
   } catch {
     return null;
   }
 }
-var SchedulerPlugin = async () => {
+function resolveSessionApiBase(attachUrl, serverUrl) {
+  if (attachUrl)
+    return attachUrl.replace(/\/+$/, "");
+  return serverUrl.toString().replace(/\/+$/, "");
+}
+function getSchedulerSessionCreateErrorMessage(error45) {
+  if (!error45)
+    return "unknown error";
+  if ("message" in error45 && typeof error45.message === "string")
+    return error45.message;
+  if ("errors" in error45 && Array.isArray(error45.errors)) {
+    const first = error45.errors.find((e) => typeof e.message === "string");
+    if (first && typeof first.message === "string")
+      return first.message;
+  }
+  return JSON.stringify(error45);
+}
+async function createSchedulerSessionWithClient(input) {
+  const body = { title: input.title, permission: input.permission };
+  const result = await input.client.session.create({ body });
+  if (result.error) {
+    throw new Error(`client.session.create failed: ${getSchedulerSessionCreateErrorMessage(result.error)}`);
+  }
+  if (!result.data?.id) {
+    throw new Error("client.session.create returned no id");
+  }
+  return result.data.id;
+}
+async function createSchedulerSessionViaFetch(input) {
+  const res = await fetch(`${input.baseUrl}/session`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ title: input.title, permission: input.permission })
+  });
+  if (!res.ok) {
+    const body = await res.text().catch(() => "");
+    throw new Error(`POST /session failed: ${res.status} ${res.statusText} ${body}`.trim());
+  }
+  const json2 = await res.json().catch(() => null);
+  if (!json2?.id) {
+    throw new Error("POST /session returned no id");
+  }
+  return json2.id;
+}
+async function verifySessionExists(input) {
+  const res = await fetch(`${input.baseUrl}/session/${encodeURIComponent(input.sessionId)}`, {
+    method: "GET",
+    signal: AbortSignal.timeout(1500)
+  });
+  if (res.status === 404) {
+    throw new Error(`Session ${input.sessionId} not found at ${input.baseUrl}`);
+  }
+  if (!res.ok) {
+    throw new Error(`GET /session/${input.sessionId} failed: ${res.status} ${res.statusText}`);
+  }
+}
+var SchedulerPlugin = async ({ client, serverUrl }) => {
+  initRegistryForPlugin({
+    serverUrl,
+    agent: process.stdout.isTTY ? "tui" : "headless"
+  });
   return {
     tool: {
       schedule_job: tool({
-        description: "Schedule a recurring job to run an opencode prompt. Uses launchd (Mac), systemd (Linux), Windows Task Scheduler, or cron fallback when needed.",
+        description: [
+          "Create a NEW recurring scheduled job that fires an opencode prompt on a cron schedule.",
+          "Trigger phrases: 'schedule', 'every day/hour/Monday at', 'recurring', 'daily', 'weekly',",
+          "'automate', 'set up a cron', 'run X every N hours', 'background task on a timer'.",
+          "Persists to an OS-level scheduler entry that survives reboots and runs whether opencode",
+          "is open or not (this is NOT an in-process timer).",
+          "NOT for one-off 'run this now' \u2014 use run_job. NOT for editing an existing job \u2014 use update_job.",
+          "sessionPolicy is REQUIRED \u2014 no default. ALWAYS elicit the choice from the user explicitly,",
+          "do not guess; a silent default leads to silent failures (job runs, TUI never refreshes).",
+          "Options: 'current' (continues this chat \u2014 fine for reminders that should land in the",
+          "current thread), 'new-per-job' (one fresh long-running session reused by every fire \u2014",
+          "best for independent background tasks), 'new-per-run' (a brand-new session every fire \u2014",
+          "best for stateless probes), 'existing' (user supplied an explicit sessionId).",
+          "attachUrl is best-effort: omit it and the plugin auto-detects the serverUrl of the",
+          "opencode you are running in (when launched with --port). Pass it explicitly only when",
+          "targeting a different opencode server.",
+          "Auto-installs the scheduled-job-best-practices skill into the workdir if not already",
+          "present (idempotent; existing files are left untouched), so scheduled prompts can",
+          "reference it via @scheduled-job-best-practices without a separate install_skill call."
+        ].join(" "),
         args: {
           name: tool.schema.string().describe("A short name for the job (e.g. 'standing desk search')"),
           schedule: tool.schema.string().describe("Cron expression: '0 9 * * *' (daily 9am), '0 */6 * * *' (every 6h), '30 8 * * 1' (Monday 8:30am)"),
@@ -14380,14 +15331,19 @@ var SchedulerPlugin = async () => {
           source: tool.schema.string().optional().describe("Optional: source app (e.g. 'marketplace') - used for filtering"),
           workdir: tool.schema.string().optional().describe("Optional: working directory to run from (for MCP config). Defaults to current directory."),
           attachUrl: tool.schema.string().optional().describe("Optional: attach URL for opencode run (e.g. http://localhost:4096)."),
+          sessionPolicy: tool.schema.string().describe("REQUIRED \u2014 no default. Ask the user which policy fits before calling. 'current' (continues this chat \u2014 for reminders into the live thread; needs a TUI launched with --port for live in-TUI delivery, otherwise the message lands in storage but the open TUI does not refresh until reopen), 'existing' (write into an explicit sessionId \u2014 supply sessionId), 'new-per-job' (one fresh session reused by every fire \u2014 for independent long-running background tasks), 'new-per-run' (a brand-new session every fire \u2014 for stateless probes)."),
+          sessionId: tool.schema.string().optional().describe("Optional: explicit session id (required when sessionPolicy='existing')."),
+          executionPolicy: tool.schema.string().optional().describe("Optional: 'prefer-live-server' (default; live HTTP delivery if reachable, else headless) or 'headless-only' (always spawn CLI, no live HTTP)."),
+          deliveryPolicy: tool.schema.string().optional().describe("Optional: 'execute' (default; wait for idle session) or 'leave-message' (post immediately with noReply, user picks up later)."),
           timeoutSeconds: tool.schema.number().optional().describe("Optional: max runtime in seconds (0 disables)."),
           format: tool.schema.string().optional().describe("Optional: output format ('text' or 'json').")
         },
-        async execute(args) {
+        async execute(args, ctx) {
           const format = normalizeFormat(args.format);
           const slug = args.source ? `${args.source}-${slugify(args.name)}` : slugify(args.name);
           const workdir = normalizeWorkdirPath(args.workdir || process.cwd());
           const scopeId = deriveScopeId(workdir);
+          const skillEnsure = ensureBestPracticesSkill(workdir);
           if (loadScopedJob(scopeId, slug)) {
             return errorResult(format, `Job "${slug}" already exists in this workspace scope (${scopeId}). Delete it first or use a different name.`);
           }
@@ -14431,9 +15387,8 @@ var SchedulerPlugin = async () => {
             const msg = error45 instanceof Error ? error45.message : String(error45);
             return errorResult(format, `Invalid run spec: ${msg}`);
           }
-          let attachUrl;
           try {
-            attachUrl = normalizeAttachUrl(args.attachUrl);
+            normalizeAttachUrl(args.attachUrl);
           } catch (error45) {
             const msg = error45 instanceof Error ? error45.message : String(error45);
             return errorResult(format, msg);
@@ -14443,6 +15398,102 @@ var SchedulerPlugin = async () => {
           } catch (error45) {
             const msg = error45 instanceof Error ? error45.message : String(error45);
             return errorResult(format, `Invalid cron schedule: ${msg}`);
+          }
+          let sessionPolicy;
+          try {
+            sessionPolicy = parseSessionPolicy(args.sessionPolicy);
+          } catch (error45) {
+            const msg = error45 instanceof Error ? error45.message : String(error45);
+            return errorResult(format, msg);
+          }
+          let executionPolicy;
+          try {
+            executionPolicy = parseExecutionPolicy(args.executionPolicy);
+          } catch (error45) {
+            const msg = error45 instanceof Error ? error45.message : String(error45);
+            return errorResult(format, msg);
+          }
+          let deliveryPolicy;
+          try {
+            deliveryPolicy = parseDeliveryPolicy(args.deliveryPolicy);
+          } catch (error45) {
+            const msg = error45 instanceof Error ? error45.message : String(error45);
+            return errorResult(format, msg);
+          }
+          let effectiveAttachUrl;
+          try {
+            effectiveAttachUrl = resolveEffectiveAttachUrl({
+              argAttachUrl: args.attachUrl,
+              serverUrl,
+              sessionPolicy,
+              executionPolicy
+            });
+          } catch (error45) {
+            const msg = error45 instanceof Error ? error45.message : String(error45);
+            return errorResult(format, msg);
+          }
+          const attachUrl = effectiveAttachUrl.attachUrl;
+          const policyError = validateSessionPolicyArgs({
+            sessionPolicy,
+            executionPolicy,
+            deliveryPolicy,
+            sessionId: args.sessionId,
+            attachUrl,
+            toolSessionID: ctx?.sessionID
+          });
+          if (policyError) {
+            return errorResult(format, policyError);
+          }
+          const sessionApiBase = resolveSessionApiBase(attachUrl, serverUrl);
+          let resolvedSessionId;
+          if (sessionPolicy === "current") {
+            resolvedSessionId = (args.sessionId ?? "").trim() || ctx?.sessionID;
+            if (resolvedSessionId && attachUrl) {
+              try {
+                await verifySessionExists({ baseUrl: sessionApiBase, sessionId: resolvedSessionId });
+              } catch (error45) {
+                const msg = error45 instanceof Error ? error45.message : String(error45);
+                return errorResult(format, `sessionPolicy='current': ${msg}`);
+              }
+            }
+          } else if (sessionPolicy === "existing") {
+            resolvedSessionId = (args.sessionId ?? "").trim();
+            if (attachUrl) {
+              try {
+                await verifySessionExists({ baseUrl: sessionApiBase, sessionId: resolvedSessionId });
+              } catch (error45) {
+                const msg = error45 instanceof Error ? error45.message : String(error45);
+                return errorResult(format, `sessionPolicy='existing': ${msg}`);
+              }
+            }
+          } else if (sessionPolicy === "new-per-job") {
+            try {
+              resolvedSessionId = attachUrl ? await createSchedulerSessionViaFetch({
+                baseUrl: sessionApiBase,
+                title: args.name,
+                permission: SCHEDULED_PERMS
+              }) : await createSchedulerSessionWithClient({
+                client,
+                title: args.name,
+                permission: SCHEDULED_PERMS
+              });
+            } catch (error45) {
+              const msg = error45 instanceof Error ? error45.message : String(error45);
+              return errorResult(format, `sessionPolicy='new-per-job': ${msg}`);
+            }
+          }
+          let capturedEnv;
+          try {
+            capturedEnv = captureJobEnv(loadSchedulerConfig().env);
+          } catch (error45) {
+            const msg = error45 instanceof Error ? error45.message : String(error45);
+            return errorResult(format, `Failed to capture env: ${msg}`);
+          }
+          if (resolvedSessionId) {
+            run.session = resolvedSessionId;
+          }
+          if (attachUrl) {
+            run.attachUrl = attachUrl;
           }
           const job = {
             scopeId,
@@ -14454,11 +15505,16 @@ var SchedulerPlugin = async () => {
             source: args.source,
             workdir,
             attachUrl,
+            sessionPolicy,
+            executionPolicy,
+            deliveryPolicy,
             timeoutSeconds: args.timeoutSeconds,
+            env: capturedEnv,
             createdAt: new Date().toISOString()
           };
           try {
             job.invocation = buildOpencodeArgs(job);
+            job.headlessInvocation = buildOpencodeArgs(job, { withAttachUrl: false });
           } catch (error45) {
             const msg = error45 instanceof Error ? error45.message : String(error45);
             return errorResult(format, `Failed to build invocation: ${msg}`);
@@ -14469,21 +15525,25 @@ var SchedulerPlugin = async () => {
             const platformName = backend;
             const reliabilityLine = backend === "schtasks" ? "Windows note: scheduled runs use Task Scheduler directly. For advanced reliability guarantees, prefer simple cron schedules or split complex jobs." : backend === "cron" ? "Cron note: missed runs during sleep are not replayed. For catch-up behavior, use launchd or systemd when available." : "The job will run at the scheduled time. If your computer was asleep, it will catch up when it wakes.";
             const primaryLine = run.command ? `Command: ${run.command}${run.arguments ? ` ${run.arguments}` : ""}` : `Prompt: ${(run.prompt ?? "").slice(0, 100)}${(run.prompt ?? "").length > 100 ? "..." : ""}`;
-            const attachLine = run.attachUrl ? `Attach URL: ${run.attachUrl}
-` : "";
-            return okResult(format, `Scheduled "${args.name}"
-
-Schedule: ${args.schedule} (${describeCron(args.schedule)})
-Platform: ${platformName}
-Working Directory: ${workdir}
-${attachLine}${primaryLine}
-
-${reliabilityLine}
-
-Commands:
-- "run ${args.name} now" - run immediately
-- "show my jobs" - list all
-- "delete job ${args.name}" - remove`, { job });
+            const successText = formatScheduleJobSuccess({
+              name: args.name,
+              schedule: args.schedule,
+              scheduleHuman: describeCron(args.schedule),
+              platformName,
+              workdir,
+              attachUrl: run.attachUrl,
+              attachUrlAutoFromServerUrl: effectiveAttachUrl.autoFromServerUrl,
+              primaryLine,
+              skillEnsure,
+              internalWarning: effectiveAttachUrl.internalWarning,
+              reliabilityLine
+            });
+            return okResult(format, successText, {
+              job,
+              skill: skillEnsure,
+              attachUrlSource: effectiveAttachUrl.autoFromServerUrl ? "serverUrl-auto" : attachUrl ? "explicit" : "none",
+              internalServerWarning: effectiveAttachUrl.internalWarning
+            });
           } catch (error45) {
             deleteJobFile(job);
             const msg = error45 instanceof Error ? error45.message : String(error45);
@@ -14492,7 +15552,14 @@ Commands:
         }
       }),
       list_jobs: tool({
-        description: "List all scheduled jobs. Optionally filter by source app.",
+        description: [
+          "List existing scheduled jobs in the current project workdir (or across all projects with",
+          "allScopes=true). Trigger phrases: 'what jobs do I have', 'show my schedules', 'list cron',",
+          "'any active scheduled tasks', 'what's scheduled', 'show scheduler jobs'.",
+          "Read-only and cheap. Use this BEFORE update_job / delete_job / run_job / get_job / job_logs",
+          "when the user refers to a job by description rather than exact slug, so you can resolve",
+          "the right slug. Returns name, slug, schedule, last run status, and sessionPolicy per job."
+        ].join(" "),
         args: {
           source: tool.schema.string().optional().describe("Filter by source app (e.g. 'marketplace')"),
           allScopes: tool.schema.boolean().optional().describe("List jobs across all scopes."),
@@ -14539,7 +15606,12 @@ ${lines.join(`
         }
       }),
       get_version: tool({
-        description: "Show the scheduler plugin version and opencode binary info.",
+        description: [
+          "Report the opencode-scheduler plugin version and the resolved opencode binary path/version.",
+          "Trigger phrases: 'what version', 'is the scheduler installed', 'which opencode is being used',",
+          "'show plugin version', 'debug scheduler setup'. Read-only. Use before troubleshooting to",
+          "confirm which plugin build is loaded and which opencode executable will run scheduled jobs."
+        ].join(" "),
         args: {
           format: tool.schema.string().optional().describe("Optional: output format ('text' or 'json').")
         },
@@ -14562,7 +15634,15 @@ ${lines.join(`
         }
       }),
       get_skill: tool({
-        description: "Get built-in skill templates to copy into your project.",
+        description: [
+          "Return the source text of a built-in skill template without writing it to disk.",
+          "Currently bundles 'scheduled-job-best-practices' (sessionPolicy / delivery / env parity /",
+          "auto-permissions / runtime date snippets / idempotency patterns).",
+          "Trigger phrases: 'show the skill', 'what does the best-practices skill contain', 'preview",
+          "the scheduler skill', 'how should I write a scheduled prompt'. Read-only.",
+          "To actually install the skill into the repo (.opencode/skill/<name>/SKILL.md) use install_skill.",
+          "Read this BEFORE writing a non-trivial scheduled prompt to follow the documented patterns."
+        ].join(" "),
         args: {
           name: tool.schema.string().optional().describe("Skill name (default: scheduled-job-best-practices)"),
           format: tool.schema.string().optional().describe("Optional: output format ('text' or 'json').")
@@ -14594,7 +15674,14 @@ ${content.trim()}
         }
       }),
       install_skill: tool({
-        description: "Install a built-in skill into your repo's .opencode/skill directory.",
+        description: [
+          "Write a built-in skill template into .opencode/skill/<name>/SKILL.md in the current repo so",
+          "scheduled prompts can reference it via @<name>.",
+          "Trigger phrases: 'install the skill', 'add the best-practices skill to my project',",
+          "'set up scheduled-job-best-practices', 'I want to @-reference the skill in my prompt'.",
+          "Mutates repo files (creates a directory + writes SKILL.md). Idempotent overwrite.",
+          "Use get_skill first if the user only wants to read the template without writing it."
+        ].join(" "),
         args: {
           name: tool.schema.string().optional().describe("Skill name (default: scheduled-job-best-practices)"),
           directory: tool.schema.string().optional().describe("Repo root directory to install into (defaults to current directory)."),
@@ -14633,8 +15720,53 @@ ${content.trim()}
           }
         }
       }),
+      install_server_config: tool({
+        description: [
+          "Write `server.port` (default 0) into ~/.config/opencode/opencode.json so every opencode start",
+          "picks a TCP port and registers itself with the F5 plugin-side runtime registry \u2014 closing the",
+          "loop where scheduled jobs scheduled without an explicit `attachUrl` can be auto-discovered at",
+          "fire-time. Trigger phrases: 'install server config', 'enable port-0 in opencode config',",
+          "'set up auto-attach', 'configure opencode to listen on a port'.",
+          "Single-purpose, idempotent. Strictly limited to that one config file \u2014 does NOT touch shell rc",
+          "files, environment, launchd plists, or anything else.",
+          "Two-step UX: call without `confirm: true` first to get a preview + diff; call again with",
+          "`confirm: true` to actually write. If the config already has `server.port` set to a different",
+          "value, also pass `overwrite: true` to replace it (preview surfaces the previous value first).",
+          "After a successful write the user must restart opencode for it to take effect \u2014 `server.port`",
+          "is read at startup, not live-reloaded. Requires the F7 upstream Zod schema fix to accept",
+          "`port: 0`; on a pre-F7 opencode pass an explicit positive port instead."
+        ].join(" "),
+        args: {
+          port: tool.schema.number().optional().describe(`Port to write into server.port. Default ${DEFAULT_SERVER_PORT} (= try 4096, then OS-assigned random \u2014 matches CLI --port 0). Pass a positive port (e.g. 4096) when the host opencode predates the F7 schema fix.`),
+          overwrite: tool.schema.boolean().optional().describe("Allow replacing an existing server.port set to a different value (default false)."),
+          confirm: tool.schema.boolean().optional().describe("Required to actually write the file. Without this the tool returns a dry-run preview only."),
+          configPath: tool.schema.string().optional().describe(`Override config file path (defaults to ${DEFAULT_OPENCODE_CONFIG_PATH}).`),
+          format: tool.schema.string().optional().describe("Optional: output format ('text' or 'json').")
+        },
+        async execute(args) {
+          const format = normalizeFormat(args.format);
+          const result = executeInstallServerConfig({
+            port: args.port,
+            overwrite: args.overwrite,
+            confirm: args.confirm,
+            configPath: args.configPath
+          });
+          const text = formatInstallServerConfigResult(result);
+          if (result.ok) {
+            return okResult(format, text, { result });
+          }
+          return errorResult(format, text, { result });
+        }
+      }),
       get_job: tool({
-        description: "Get details for a scheduled job",
+        description: [
+          "Fetch full metadata for ONE scheduled job by name or slug: cron schedule, prompt, sessionPolicy,",
+          "attachUrl, env mode, last run timestamp, last run status, exit code, log path.",
+          "Trigger phrases: 'show details for X', 'what does the X job do', 'when did X last run',",
+          "'inspect job', 'what's the schedule for X', 'show config for X job'.",
+          "Read-only. Use BEFORE update_job to know the current values, or after run_job to confirm",
+          "lastRun fields. If the user refers to the job vaguely, run list_jobs first to resolve the slug."
+        ].join(" "),
         args: {
           name: tool.schema.string().describe("The job name or slug"),
           format: tool.schema.string().optional().describe("Optional: output format ('text' or 'json').")
@@ -14649,7 +15781,15 @@ ${content.trim()}
         }
       }),
       update_job: tool({
-        description: "Update a scheduled job",
+        description: [
+          "Modify fields on an EXISTING scheduled job: cron schedule, prompt, sessionPolicy / sessionId,",
+          "executionPolicy, deliveryPolicy, attachUrl, timeoutSeconds, model, agent, files.",
+          "Trigger phrases: 'change', 'update', 'edit', 'move X to 10am', 'change schedule', 'switch X",
+          "to a different model', 'point job at this attachUrl', 'add files to job'.",
+          "Reinstalls the OS scheduler entry (launchd / systemd / Task Scheduler / cron line) \u2014 safe to",
+          "re-run on the same job. Requires the job to already exist. Run list_jobs / get_job first if",
+          "the slug is ambiguous. NOT for creating a new job \u2014 use schedule_job."
+        ].join(" "),
         args: {
           name: tool.schema.string().describe("The job name or slug"),
           schedule: tool.schema.string().optional().describe("Updated cron expression"),
@@ -14763,13 +15903,14 @@ ${content.trim()}
           };
           try {
             updatedJob.invocation = buildOpencodeArgs(updatedJob);
+            updatedJob.headlessInvocation = buildOpencodeArgs(updatedJob, { withAttachUrl: false });
           } catch (error45) {
             const msg = error45 instanceof Error ? error45.message : String(error45);
             return errorResult(format, `Failed to build invocation: ${msg}`);
           }
           try {
-            const oldScopeId = job.scopeId || deriveScopeId(job.workdir || homedir());
-            const nextScopeId = updatedJob.scopeId || deriveScopeId(updatedJob.workdir || homedir());
+            const oldScopeId = job.scopeId || deriveScopeId(job.workdir || homedir3());
+            const nextScopeId = updatedJob.scopeId || deriveScopeId(updatedJob.workdir || homedir3());
             const scopeChanged = oldScopeId !== nextScopeId;
             if (scopeChanged) {
               uninstallJob(job);
@@ -14778,9 +15919,9 @@ ${content.trim()}
             installJob(updatedJob);
             if (scopeChanged) {
               const oldPath = jobFilePath(oldScopeId, job.slug);
-              if (existsSync(oldPath)) {
+              if (existsSync3(oldPath)) {
                 try {
-                  unlinkSync(oldPath);
+                  unlinkSync2(oldPath);
                 } catch {}
               }
             }
@@ -14796,7 +15937,15 @@ ${content.trim()}
         }
       }),
       delete_job: tool({
-        description: "Delete a scheduled job",
+        description: [
+          "Remove a single scheduled job: deletes the job definition AND uninstalls its OS scheduler",
+          "entry (launchd plist / systemd unit / Task Scheduler task / cron line). Logs are kept.",
+          "Trigger phrases: 'delete X', 'remove the X job', 'stop the X schedule', 'cancel scheduled X',",
+          "'unschedule X', 'kill the cron for X'.",
+          "Single job only. For wiping ALL jobs across all projects use cleanup_global. Destructive: the",
+          "schedule will not fire again. Recreate via schedule_job if needed. Resolve slug via list_jobs",
+          "if the user is vague."
+        ].join(" "),
         args: {
           name: tool.schema.string().describe("The job name or slug to delete"),
           format: tool.schema.string().optional().describe("Optional: output format ('text' or 'json').")
@@ -14809,17 +15958,25 @@ ${content.trim()}
           }
           uninstallJob(job);
           deleteJobFile(job);
-          const legacyPath = join(LEGACY_JOBS_DIR, `${job.slug}.json`);
-          if (existsSync(legacyPath)) {
+          const legacyPath = join3(LEGACY_JOBS_DIR, `${job.slug}.json`);
+          if (existsSync3(legacyPath)) {
             try {
-              unlinkSync(legacyPath);
+              unlinkSync2(legacyPath);
             } catch {}
           }
           return okResult(format, `Deleted job "${job.name}"`, { job });
         }
       }),
       cleanup_global: tool({
-        description: "Clean up scheduler artifacts globally across all scopes. Removes job definitions everywhere; optionally remove logs and run history.",
+        description: [
+          "GLOBAL nuke of scheduler artifacts across ALL projects on this machine: every job definition,",
+          "every OS scheduler entry, every lock file. Optionally also logs and run history.",
+          "Trigger phrases: 'clean up everything', 'reset the scheduler', 'wipe all scheduled jobs',",
+          "'remove all cron entries created by the plugin', 'global cleanup', 'nuke scheduler state'.",
+          "DESTRUCTIVE and IRREVERSIBLE. Always defaults to dry-run; pass confirm:true to actually",
+          "delete. Reports counts grouped by location. NEVER call without explicit user intent \u2014 for",
+          "removing one job use delete_job instead. Affects every workdir/scope, not just the current one."
+        ].join(" "),
         args: {
           includeHistory: tool.schema.boolean().optional().describe("Also remove run history and logs across all scopes (default false)."),
           confirm: tool.schema.boolean().optional().describe("Set true to execute deletion. Default is dry run with no destructive changes."),
@@ -14843,7 +16000,15 @@ ${content.trim()}
         }
       }),
       run_job: tool({
-        description: "Run a scheduled job immediately",
+        description: [
+          "Fire an existing scheduled job ONCE immediately, outside its cron schedule. Fire-and-forget.",
+          "Trigger phrases: 'run X now', 'trigger', 'test the job', 'execute X manually', 'fire it now',",
+          "'kick off X', 'run job out of band', 'check if it works'.",
+          "Does NOT change the cron schedule or any job config. Output appends to the same log file as",
+          "scheduled runs (read with job_logs). Useful for testing a freshly created or updated job",
+          "without waiting for its next scheduled tick. NOT for creating a new job \u2014 use schedule_job.",
+          "Resolve slug via list_jobs if needed."
+        ].join(" "),
         args: {
           name: tool.schema.string().describe("The job name or slug"),
           prompt: tool.schema.string().optional().describe("Override prompt for this run"),
@@ -14936,7 +16101,13 @@ Logs: ${runResult.logPath}${attachHint}${logSection}`, {
         }
       }),
       job_logs: tool({
-        description: "View the latest logs from a scheduled job",
+        description: [
+          "Show the most recent stdout/stderr from a scheduled job's log file (last N lines, default tail).",
+          "Trigger phrases: 'show logs for X', 'did X run', 'why did X fail', 'debug job', 'what",
+          "happened with X', 'tail the scheduler log', 'check job output', 'last run output'.",
+          "Read-only. Use after run_job to inspect the immediate result, or when get_job shows",
+          "lastRunStatus=failed to find the cause. Returns raw supervised process output."
+        ].join(" "),
         args: {
           name: tool.schema.string().describe("The job name or slug"),
           lines: tool.schema.number().optional().describe("Number of lines from the end of the log (default 200)."),
@@ -14966,8 +16137,7 @@ ${logs}`, { job, logPath, logs });
     }
   };
 };
-var src_default = SchedulerPlugin;
 export {
-  src_default as default,
+  SchedulerPlugin as default,
   SchedulerPlugin
 };

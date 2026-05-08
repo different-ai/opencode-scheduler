@@ -3,24 +3,26 @@
   "version": "1.3.0",
   "description": "OpenCode plugin for scheduling recurring jobs using launchd, systemd, Task Scheduler, or cron fallback",
   "main": "dist/index.js",
-  "types": "dist/index.d.ts",
+  "types": "dist/plugin-entry.d.ts",
   "type": "module",
   "files": [
     "dist"
   ],
   "exports": {
     ".": {
-      "types": "./dist/index.d.ts",
+      "types": "./dist/plugin-entry.d.ts",
       "import": "./dist/index.js"
     }
   },
   "scripts": {
-    "build": "bun build src/index.ts --outdir dist --target bun --format esm && tsc --emitDeclarationOnly",
+    "build": "bun build src/plugin-entry.ts --outdir dist --target bun --format esm --entry-naming index.js && bun build src/runner.ts --outdir dist --target node --format esm && tsc -p tsconfig.build.json --emitDeclarationOnly",
     "clean": "rm -rf dist",
     "prepublishOnly": "bun run clean && bun run build",
     "release:patch": "npm version patch && npm publish",
     "release:minor": "npm version minor && npm publish",
     "release:major": "npm version major && npm publish",
+    "test": "bun test",
+    "test:watch": "bun test --watch",
     "typecheck": "tsc --noEmit"
   },
   "keywords": [

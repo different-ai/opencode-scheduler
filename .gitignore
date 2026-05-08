@@ -2,3 +2,10 @@ node_modules/
 *.log
 .DS_Store
 bun.lock
+
+# Test build artifacts (tsc emits .d.ts for *.test.ts via emitDeclarationOnly)
+dist/*.test.d.ts
+
+# Local agent scratch (plans, tmp, notes) and IDE
+agent/
+.idea/
