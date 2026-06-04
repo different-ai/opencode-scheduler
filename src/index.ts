@@ -13,7 +13,7 @@
  */
 import type { Plugin } from "@opencode-ai/plugin"
 import { tool } from "@opencode-ai/plugin"
-import { createWriteStream, existsSync, mkdirSync, readdirSync, readFileSync, rmSync, writeFileSync, unlinkSync } from "fs"
+import { createWriteStream, existsSync, mkdirSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync, unlinkSync } from "fs"
 import { basename, dirname, join, resolve as resolvePath } from "path"
 import { homedir, platform } from "os"
 import { execFileSync, execSync, spawn, type ChildProcess } from "child_process"
@@ -1503,6 +1503,12 @@ function uninstallJob(job: Job): void {
 function ensureScopeStorage(scopeId: string): void {
   ensureDir(SCHEDULER_DIR)
   ensureDir(SCOPES_DIR)
+  const dir = scopeDir(scopeId)
+  try {
+    if (!existsSync(dir) || !statSync(dir).isDirectory()) return
+  } catch {
+    return
+  }
   ensureDir(scopeJobsDir(scopeId))
   ensureDir(scopeLocksDir(scopeId))
   ensureDir(scopeRunsDir(scopeId))
@@ -1534,17 +1540,13 @@ function loadAllScopedJobs(scopeId: string): Job[] {
     .filter(Boolean) as Job[]
 }
 
-function listScopeIds(): string[] {
-  ensureDir(SCOPES_DIR)
+/** @internal Exported for testing. */
+export function listScopeIds(root: string = SCOPES_DIR): string[] {
+  ensureDir(root)
   try {
-    return readdirSync(SCOPES_DIR)
-      .filter((name) => {
-        try {
-          return existsSync(scopeDir(name))
-        } catch {
-          return false
-        }
-      })
+    return readdirSync(root, { withFileTypes: true })
+      .filter((entry) => entry.isDirectory())
+      .map((entry) => entry.name)
       .sort()
   } catch {
     return []

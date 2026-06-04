@@ -12,5 +12,7 @@
  * - Environment variable injection (PATH for node/npx)
  */
 import type { Plugin } from "@opencode-ai/plugin";
+/** @internal Exported for testing. */
+export declare function listScopeIds(root?: string): string[];
 export declare const SchedulerPlugin: Plugin;
 export default SchedulerPlugin;

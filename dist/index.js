@@ -12331,7 +12331,7 @@ function tool(input) {
 }
 tool.schema = exports_external;
 // src/index.ts
-import { createWriteStream, existsSync, mkdirSync, readdirSync, readFileSync, rmSync, writeFileSync, unlinkSync } from "fs";
+import { createWriteStream, existsSync, mkdirSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync, unlinkSync } from "fs";
 import { basename, dirname, join, resolve as resolvePath } from "path";
 import { homedir, platform } from "os";
 import { execFileSync, execSync, spawn } from "child_process";
@@ -13517,6 +13517,13 @@ function uninstallJob(job) {
 function ensureScopeStorage(scopeId) {
   ensureDir(SCHEDULER_DIR);
   ensureDir(SCOPES_DIR);
+  const dir = scopeDir(scopeId);
+  try {
+    if (!existsSync(dir) || !statSync(dir).isDirectory())
+      return;
+  } catch {
+    return;
+  }
   ensureDir(scopeJobsDir(scopeId));
   ensureDir(scopeLocksDir(scopeId));
   ensureDir(scopeRunsDir(scopeId));
@@ -13544,16 +13551,10 @@ function loadAllScopedJobs(scopeId) {
     }
   }).filter(Boolean);
 }
-function listScopeIds() {
-  ensureDir(SCOPES_DIR);
+function listScopeIds(root = SCOPES_DIR) {
+  ensureDir(root);
   try {
-    return readdirSync(SCOPES_DIR).filter((name) => {
-      try {
-        return existsSync(scopeDir(name));
-      } catch {
-        return false;
-      }
-    }).sort();
+    return readdirSync(root, { withFileTypes: true }).filter((entry) => entry.isDirectory()).map((entry) => entry.name).sort();
   } catch {
     return [];
   }
@@ -14968,6 +14969,7 @@ ${logs}`, { job, logPath, logs });
 };
 var src_default = SchedulerPlugin;
 export {
+  listScopeIds,
   src_default as default,
   SchedulerPlugin
 };
