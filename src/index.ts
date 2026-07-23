@@ -26,6 +26,7 @@ const LOGS_DIR = join(OPENCODE_CONFIG, "logs")
 const SCHEDULER_DIR = join(OPENCODE_CONFIG, "scheduler")
 const SCOPES_DIR = join(SCHEDULER_DIR, "scopes")
 const SUPERVISOR_PATH = join(SCHEDULER_DIR, "supervisor.pl")
+const SUPERVISOR_JS_PATH = join(SCHEDULER_DIR, "supervisor.js")
 const SCHEDULER_CONFIG = join(OPENCODE_CONFIG, "opencode-scheduler.json")
 
 // Platform detection
@@ -350,9 +351,172 @@ print "\n=== Finished $finished_at status=$final_status exitCode=$exit_code dura
 exit($exit_code);
 `
 
+// Node.js supervisor for Windows (port of the Perl supervisor above)
+const SUPERVISOR_JS_SCRIPT = `#!/usr/bin/env node
+/**
+ * opencode-scheduler supervisor for Windows (Node.js port)
+ * Usage: node supervisor.js <job.json>
+ */
+const fs = require("fs");
+const path = require("path");
+const os = require("os");
+const { spawn, execSync } = require("child_process");
+const crypto = require("crypto");
+
+function isoNow() { return new Date().toISOString().replace(/\\.\\d{3}Z$/, "+0000"); }
+function readJson(p) { return JSON.parse(fs.readFileSync(p, "utf-8")); }
+function writeJsonAtomic(p, data) {
+  const tmp = p + ".tmp." + process.pid;
+  fs.writeFileSync(tmp, JSON.stringify(data, null, 2));
+  fs.renameSync(tmp, p);
+}
+function appendJsonl(p, rec) { fs.appendFileSync(p, JSON.stringify(rec) + "\\n"); }
+function pidAlive(pid) {
+  if (!pid) return false;
+  try { process.kill(pid, 0); return true; } catch { return false; }
+}
+function randomId() { return crypto.randomBytes(8).toString("hex"); }
+function ensureDir(d) { if (!fs.existsSync(d)) fs.mkdirSync(d, { recursive: true }); }
+
+const jobPath = process.argv[2];
+if (!jobPath) { console.error("usage: supervisor.js <job.json>"); process.exit(1); }
+
+const job = readJson(jobPath);
+const scopeId = job.scopeId || "";
+const slug = job.slug || "";
+if (!scopeId || !slug) { console.error("job missing scopeId/slug"); process.exit(1); }
+
+const home = os.homedir();
+const configRoot = path.join(home, ".config", "opencode");
+const schedulerRoot = path.join(configRoot, "scheduler", "scopes", scopeId);
+const locksDir = path.join(schedulerRoot, "locks");
+const runsDir = path.join(schedulerRoot, "runs");
+const logsDir = path.join(configRoot, "logs", "scheduler", scopeId);
+
+ensureDir(locksDir); ensureDir(runsDir); ensureDir(logsDir);
+
+const logPath = path.join(logsDir, slug + ".log");
+const logStream = fs.createWriteStream(logPath, { flags: "a" });
+function log(msg) { const line = msg + "\\n"; process.stdout.write(line); logStream.write(line); }
+
+// No-overlap check
+const lockPath = path.join(locksDir, slug + ".json");
+if (fs.existsSync(lockPath)) {
+  try {
+    const lock = readJson(lockPath);
+    const pid = (lock && lock.pid) || 0;
+    if (pidAlive(pid)) {
+      log("\\n=== Scheduled run skipped (already running pid=" + pid + ") " + isoNow() + " ===");
+      logStream.end(); process.exit(0);
+    }
+  } catch {}
+  fs.unlinkSync(lockPath);
+}
+
+const runId = Date.now() + "-" + randomId();
+const startedAt = isoNow();
+const t0 = Date.now();
+writeJsonAtomic(lockPath, { pid: process.pid, startedAt: startedAt, runId: runId });
+
+job.lastRunAt = startedAt;
+job.lastRunSource = "scheduled";
+job.lastRunStatus = "running";
+delete job.lastRunExitCode;
+delete job.lastRunError;
+job.updatedAt = startedAt;
+writeJsonAtomic(jobPath, job);
+
+// Force non-interactive
+let perm = { question: "deny" };
+if (process.env.OPENCODE_PERMISSION) {
+  try {
+    const existing = JSON.parse(process.env.OPENCODE_PERMISSION);
+    if (existing && typeof existing === "object") perm = Object.assign({}, existing, perm);
+  } catch {}
+}
+process.env.OPENCODE_PERMISSION = JSON.stringify(perm);
+process.env.OPENCODE_SCHEDULER_RUN_ID = runId;
+
+log("\\n=== Scheduled run " + startedAt + " runId=" + runId + " ===");
+
+const inv = job.invocation;
+if (!inv || !inv.command || !Array.isArray(inv.args)) {
+  log("\\n=== Supervisor error " + isoNow() + ": job missing invocation.command/args ===");
+  job.lastRunStatus = "failed"; job.lastRunError = "job missing invocation"; job.updatedAt = isoNow();
+  writeJsonAtomic(jobPath, job); fs.unlinkSync(lockPath); logStream.end(); process.exit(1);
+}
+
+const workdir = job.workdir || home;
+const timeout = (typeof job.timeoutSeconds === "number" && job.timeoutSeconds > 0) ? job.timeoutSeconds : undefined;
+
+log("\\n=== Running: " + inv.command + " " + inv.args.join(" ").slice(0, 200) + " ===");
+
+const child = spawn(inv.command, inv.args, {
+  cwd: workdir, stdio: ["ignore", "pipe", "pipe"], detached: false, env: Object.assign({}, process.env)
+});
+child.stdout.pipe(logStream, { end: false });
+child.stderr.pipe(logStream, { end: false });
+
+let timedOut = false;
+let timer;
+if (timeout) {
+  timer = setTimeout(function() {
+    timedOut = true;
+    log("\\n=== Timeout after " + timeout + " seconds " + isoNow() + "; killing process ===");
+    try { execSync("taskkill /PID " + child.pid + " /T /F", { stdio: "ignore" }); } catch {}
+  }, timeout * 1000);
+}
+
+child.on("close", function(code) {
+  if (timer) clearTimeout(timer);
+  const finishedAt = isoNow();
+  const durationMs = Date.now() - t0;
+  const exitCode = timedOut ? 124 : (code != null ? code : 1);
+  let finalStatus, finalError;
+  if (timedOut) { finalStatus = "failed"; finalError = "timeout"; }
+  else if (code === 0) { finalStatus = "success"; }
+  else { finalStatus = "failed"; finalError = "exit code " + exitCode; }
+
+  job.lastRunStatus = finalStatus; job.lastRunExitCode = exitCode;
+  if (finalError) job.lastRunError = finalError;
+  job.updatedAt = finishedAt;
+  writeJsonAtomic(jobPath, job);
+
+  appendJsonl(path.join(runsDir, slug + ".jsonl"), {
+    runId: runId, scopeId: scopeId, slug: slug, startedAt: startedAt, finishedAt: finishedAt,
+    durationMs: durationMs, status: finalStatus, exitCode: exitCode, error: finalError,
+    pid: child.pid, logPath: logPath
+  });
+
+  try { fs.unlinkSync(lockPath); } catch {}
+  log("\\n=== Finished " + finishedAt + " status=" + finalStatus + " exitCode=" + exitCode + " durationMs=" + durationMs + " ===");
+  logStream.end(function() { process.exit(exitCode); });
+});
+
+child.on("error", function(err) {
+  if (timer) clearTimeout(timer);
+  const finishedAt = isoNow();
+  const durationMs = Date.now() - t0;
+  job.lastRunStatus = "failed"; job.lastRunError = err.message; job.updatedAt = finishedAt;
+  writeJsonAtomic(jobPath, job);
+  appendJsonl(path.join(runsDir, slug + ".jsonl"), {
+    runId: runId, scopeId: scopeId, slug: slug, startedAt: startedAt, finishedAt: finishedAt,
+    durationMs: durationMs, status: "failed", exitCode: 1, error: err.message,
+    pid: child.pid, logPath: logPath
+  });
+  try { fs.unlinkSync(lockPath); } catch {}
+  log("\\n=== Finished " + finishedAt + " status=failed error=" + err.message + " durationMs=" + durationMs + " ===");
+  logStream.end(function() { process.exit(1); });
+});
+`
+
 function ensureSupervisorScript(): void {
   ensureDir(SCHEDULER_DIR)
   writeFileSync(SUPERVISOR_PATH, SUPERVISOR_SCRIPT)
+  // On Windows, also write the Node.js supervisor (Task Scheduler runs this instead of Perl)
+  if (IS_WINDOWS) {
+    writeFileSync(SUPERVISOR_JS_PATH, SUPERVISOR_JS_SCRIPT)
+  }
 }
 
 // Job type
@@ -623,8 +787,38 @@ function findOpencode(): string {
   const override = process.env.OPENCODE_SCHEDULER_OPENCODE_PATH?.trim()
   if (override) return override
 
-  // Prefer PATH resolution so the scheduler uses the same `opencode` as the user.
-  // This fixes cases where an old install exists at ~/.opencode/bin/opencode.
+  if (IS_WINDOWS) {
+    // Windows: use 'where' instead of 'command -v'
+    try {
+      const resolved = execSync("where opencode", {
+        env: { ...process.env, PATH: getEnhancedPath() + ";" + (process.env.PATH ?? "") },
+        stdio: ["ignore", "pipe", "ignore"],
+      })
+        .toString()
+        .trim()
+        .split(/\r?\n/)[0] // take first result
+
+      if (resolved && existsSync(resolved)) return resolved
+    } catch {
+      // ignore
+    }
+
+    // Windows fallback paths
+    const localAppData = process.env.LOCALAPPDATA || ""
+    const winPaths = [
+      localAppData ? join(localAppData, "Programs", "opencode", "opencode.exe") : "",
+      join(homedir(), ".opencode", "bin", "opencode.exe"),
+      "C:\\Program Files\\opencode\\opencode.exe",
+    ].filter(Boolean)
+
+    for (const p of winPaths) {
+      if (existsSync(p)) return p
+    }
+
+    return "opencode" // hope it's in PATH
+  }
+
+  // Mac/Linux: prefer PATH resolution so the scheduler uses the same `opencode` as the user.
   try {
     const resolved = execSync("command -v opencode", {
       env: { ...process.env, PATH: getEnhancedPath() + ":" + (process.env.PATH ?? "") },
@@ -634,16 +828,14 @@ function findOpencode(): string {
       .trim()
 
     if (resolved) {
-      // If command -v returns a path, prefer it.
       if (resolved.includes("/")) return resolved
-      // Fallback: let the OS resolve via PATH at runtime.
       return "opencode"
     }
   } catch {
     // ignore
   }
 
-  // Fallbacks (common install locations)
+  // Unix fallbacks
   const paths = [
     "/opt/homebrew/bin/opencode",
     "/usr/local/bin/opencode",
@@ -661,6 +853,16 @@ function findOpencode(): string {
 
 // Get PATH that includes common locations for node/npx
 function getEnhancedPath(): string {
+  if (IS_WINDOWS) {
+    const localAppData = process.env.LOCALAPPDATA || ""
+    const paths = [
+      localAppData ? join(localAppData, "Programs", "opencode") : "",
+      join(homedir(), ".opencode", "bin"),
+      join(homedir(), "AppData", "Roaming", "npm"),
+      "C:\\Program Files\\nodejs",
+    ].filter(Boolean)
+    return paths.join(";")
+  }
   const paths = [
     "/opt/homebrew/bin",
     "/usr/local/bin",
@@ -896,14 +1098,46 @@ function quoteWindowsArg(value: string): string {
   return `"${value.replace(/"/g, '""')}"`
 }
 
+function findNodeExecutable(): string {
+  // On Windows, find 'node.exe' via 'where'
+  if (IS_WINDOWS) {
+    try {
+      const resolved = execSync("where node", {
+        stdio: ["ignore", "pipe", "ignore"],
+      })
+        .toString()
+        .trim()
+        .split(/\r?\n/)[0]
+      if (resolved && existsSync(resolved)) return resolved
+    } catch {}
+    // Common locations
+    const candidates = [
+      "C:\\Program Files\\nodejs\\node.exe",
+      join(homedir(), "AppData", "Roaming", "npm", "node.exe"),
+    ]
+    for (const p of candidates) {
+      if (existsSync(p)) return p
+    }
+  }
+  return "node"
+}
+
 function getWindowsInvocation(job: Job): JobInvocation {
   const invocation = job.invocation ?? buildOpencodeArgs(job)
   return invocation
 }
 
 function buildWindowsTaskCommand(job: Job): string {
-  const invocation = getWindowsInvocation(job)
-  return [invocation.command, ...invocation.args].map((arg) => quoteWindowsArg(arg)).join(" ")
+  // On Windows, Task Scheduler runs the Node.js supervisor instead of opencode directly.
+  // The supervisor handles no-overlap, timeout, non-interactive mode, and run history.
+  const scopeId = job.scopeId || deriveScopeId(job.workdir || homedir())
+  const jobPath = jobFilePath(scopeId, job.slug)
+
+  // Build the supervisor invocation: node <supervisor.js> <job.json>
+  // Use 'node' since it's guaranteed to be available (opencode is a Node.js app)
+  const nodeExe = findNodeExecutable()
+  const supervisorCmd = [nodeExe, quoteWindowsArg(SUPERVISOR_JS_PATH), quoteWindowsArg(jobPath)]
+  return supervisorCmd.join(" ")
 }
 
 function maybeStep(field: string): number | null {
@@ -1254,8 +1488,11 @@ function uninstallSystemdJob(job: Job): void {
 // === WINDOWS TASK SCHEDULER ===
 
 function installWindowsJob(job: Job): void {
-  // Remove stale task variants before (re)creating current definitions.
+  // Remove stale task variants before (recreating current definitions.
   uninstallWindowsJob(job)
+
+  // Ensure the Node.js supervisor script is written to disk
+  ensureSupervisorScript()
 
   const taskDefinitions = cronToWindowsTaskDefinitions(job)
   for (const task of taskDefinitions) {
@@ -2231,7 +2468,7 @@ function buildOpencodeArgs(job: Job): { command: string; args: string[] } {
 function buildRunEnvironment(): NodeJS.ProcessEnv {
   const enhancedPath = getEnhancedPath()
   const existingPath = process.env.PATH
-  const combinedPath = existingPath ? `${enhancedPath}:${existingPath}` : enhancedPath
+  const combinedPath = existingPath ? `${enhancedPath}${IS_WINDOWS ? ";" : ":"}${existingPath}` : enhancedPath
 
   // Keep scheduled jobs non-interactive by default.
   //
