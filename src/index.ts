@@ -1111,13 +1111,13 @@ function installLaunchdJob(job: Job): void {
 
   // Unload if exists
   try {
-    execSync(`launchctl unload "${plistPath}" 2>/dev/null`, { stdio: "ignore" })
+    execFileSync("launchctl", ["unload", plistPath], { stdio: "ignore" })
   } catch {}
 
   // Also unload legacy label (pre-scope)
   if (existsSync(legacyPlistPath)) {
     try {
-      execSync(`launchctl unload "${legacyPlistPath}" 2>/dev/null`, { stdio: "ignore" })
+      execFileSync("launchctl", ["unload", legacyPlistPath], { stdio: "ignore" })
     } catch {}
   }
 
@@ -1126,7 +1126,7 @@ function installLaunchdJob(job: Job): void {
   writeFileSync(plistPath, plist)
 
   // Load
-  execSync(`launchctl load "${plistPath}"`)
+  execFileSync("launchctl", ["load", plistPath])
 }
 
 function uninstallLaunchdJob(job: Job): void {
@@ -1140,7 +1140,7 @@ function uninstallLaunchdJob(job: Job): void {
   for (const plistPath of [scopedPlistPath, legacyPlistPath]) {
     if (!existsSync(plistPath)) continue
     try {
-      execSync(`launchctl unload "${plistPath}"`, { stdio: "ignore" })
+      execFileSync("launchctl", ["unload", plistPath], { stdio: "ignore" })
     } catch {}
     try {
       unlinkSync(plistPath)
@@ -1206,8 +1206,8 @@ function installSystemdJob(job: Job): void {
 
   // Also stop/disable legacy units (pre-scope)
   try {
-    execSync(`systemctl --user stop opencode-job-${job.slug}.timer`, { stdio: "ignore" })
-    execSync(`systemctl --user disable opencode-job-${job.slug}.timer`, { stdio: "ignore" })
+    execFileSync("systemctl", ["--user", "stop", `opencode-job-${job.slug}.timer`], { stdio: "ignore" })
+    execFileSync("systemctl", ["--user", "disable", `opencode-job-${job.slug}.timer`], { stdio: "ignore" })
   } catch {}
 
   // Write service and timer
@@ -1215,9 +1215,9 @@ function installSystemdJob(job: Job): void {
   writeFileSync(timerPath, createSystemdTimer(job))
 
   // Reload and enable
-  execSync("systemctl --user daemon-reload")
-  execSync(`systemctl --user enable opencode-job-${scopeId}-${job.slug}.timer`)
-  execSync(`systemctl --user start opencode-job-${scopeId}-${job.slug}.timer`)
+  execFileSync("systemctl", ["--user", "daemon-reload"])
+  execFileSync("systemctl", ["--user", "enable", `opencode-job-${scopeId}-${job.slug}.timer`])
+  execFileSync("systemctl", ["--user", "start", `opencode-job-${scopeId}-${job.slug}.timer`])
 }
 
 function uninstallSystemdJob(job: Job): void {
@@ -1228,8 +1228,8 @@ function uninstallSystemdJob(job: Job): void {
 
   for (const timerUnit of [scopedTimerUnit, legacyTimerUnit]) {
     try {
-      execSync(`systemctl --user stop ${timerUnit}`, { stdio: "ignore" })
-      execSync(`systemctl --user disable ${timerUnit}`, { stdio: "ignore" })
+      execFileSync("systemctl", ["--user", "stop", timerUnit], { stdio: "ignore" })
+      execFileSync("systemctl", ["--user", "disable", timerUnit], { stdio: "ignore" })
     } catch {}
   }
 
@@ -1247,7 +1247,7 @@ function uninstallSystemdJob(job: Job): void {
   }
 
   try {
-    execSync("systemctl --user daemon-reload", { stdio: "ignore" })
+    execFileSync("systemctl", ["--user", "daemon-reload"], { stdio: "ignore" })
   } catch {}
 }
 
@@ -1301,7 +1301,7 @@ function isSystemdUserAvailable(): boolean {
   if (!IS_LINUX) return false
   if (!isCommandAvailable("systemctl")) return false
   try {
-    execSync("systemctl --user show-environment", {
+    execFileSync("systemctl", ["--user", "show-environment"], {
       stdio: "ignore",
       env: buildRunEnvironment(),
     })
@@ -2582,7 +2582,7 @@ export const SchedulerPlugin: Plugin = async () => {
 
           async execute(args) {
             const format = normalizeFormat(args.format)
-            const slug = args.source ? `${args.source}-${slugify(args.name)}` : slugify(args.name)
+            const slug = args.source ? `${slugify(args.source)}-${slugify(args.name)}` : slugify(args.name)
 
             const workdir = normalizeWorkdirPath(args.workdir || process.cwd())
             const scopeId = deriveScopeId(workdir)
