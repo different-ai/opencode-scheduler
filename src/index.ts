@@ -16,8 +16,14 @@ import { tool } from "@opencode-ai/plugin"
 import { createWriteStream, existsSync, mkdirSync, readdirSync, readFileSync, rmSync, writeFileSync, unlinkSync } from "fs"
 import { basename, dirname, join, resolve as resolvePath } from "path"
 import { homedir, platform } from "os"
-import { execFileSync, execSync, spawn, type ChildProcess } from "child_process"
+import { execFileSync, spawn, type ChildProcess } from "child_process"
 import { fileURLToPath } from "url"
+import { cronToSystemdCalendars, parseCronField, splitCronExpression, validateCronExpression } from "./cron"
+import { installSystemdUnits, type SystemdCommandRunner, withSystemdRuntimeEnv } from "./systemd"
+import { installLinuxScheduler } from "./backend"
+import { readExecutableVersion } from "./process"
+import { deriveSafeScopeId, isSafeIdentifier, NAME_MAX_BYTES } from "./identifiers"
+import { resolveExecutable } from "./executable"
 
 // Storage location - shared with other opencode tools
 const OPENCODE_CONFIG = join(homedir(), ".config", "opencode")
@@ -62,34 +68,35 @@ function slugify(name: string): string {
     .replace(/^-|-$/g, "")
 }
 
+function byteLength(value: string): number {
+  return Buffer.byteLength(value, "utf8")
+}
+
+function validateSafeIdentifier(label: string, value: string): void {
+  if (!isSafeIdentifier(value)) throw new Error(`Invalid job ${label}: ${JSON.stringify(value)}`)
+}
+
+function validateJobIdentifiers(job: Job): void {
+  const scopeId = job.scopeId || deriveScopeId(job.workdir || homedir())
+  validateSafeIdentifier("scopeId", scopeId)
+  validateSafeIdentifier("slug", job.slug)
+  const names = [
+    `opencode-job-${scopeId}-${job.slug}.service`, `opencode-job-${scopeId}-${job.slug}.timer`,
+    `opencode-job-${job.slug}.service`, `opencode-job-${job.slug}.timer`,
+  ]
+  if (names.some((name) => byteLength(name) > NAME_MAX_BYTES)) {
+    throw new Error("Job scopeId/slug exceeds the platform unit filename limit")
+  }
+}
+
 function normalizeWorkdirPath(input: string): string {
   const trimmed = input.trim()
   if (!trimmed) return homedir()
   return resolvePath(trimmed)
 }
 
-function fnv1a64(input: string): bigint {
-  // 64-bit FNV-1a
-  let hash = 0xcbf29ce484222325n
-  const prime = 0x100000001b3n
-  const data = Buffer.from(input, "utf8")
-  for (const byte of data) {
-    hash ^= BigInt(byte)
-    hash = (hash * prime) & 0xffffffffffffffffn
-  }
-  return hash
-}
-
-function fnv1a64Hex(input: string): string {
-  return fnv1a64(input).toString(16).padStart(16, "0")
-}
-
 function deriveScopeId(workdir: string): string {
-  const normalized = normalizeWorkdirPath(workdir)
-  const base = slugify(basename(normalized)) || "workspace"
-  // 48 bits of hash is enough here; keep label/unit names short.
-  const suffix = fnv1a64Hex(normalized).slice(0, 12)
-  return `${base}-${suffix}`
+  return deriveSafeScopeId(normalizeWorkdirPath(workdir))
 }
 
 function scopeDir(scopeId: string): string {
@@ -626,19 +633,11 @@ function findOpencode(): string {
   // Prefer PATH resolution so the scheduler uses the same `opencode` as the user.
   // This fixes cases where an old install exists at ~/.opencode/bin/opencode.
   try {
-    const resolved = execSync("command -v opencode", {
+    execFileSync("opencode", ["--version"], {
       env: { ...process.env, PATH: getEnhancedPath() + ":" + (process.env.PATH ?? "") },
-      stdio: ["ignore", "pipe", "ignore"],
+      stdio: "ignore",
     })
-      .toString()
-      .trim()
-
-    if (resolved) {
-      // If command -v returns a path, prefer it.
-      if (resolved.includes("/")) return resolved
-      // Fallback: let the OS resolve via PATH at runtime.
-      return "opencode"
-    }
+    return "opencode"
   } catch {
     // ignore
   }
@@ -672,78 +671,6 @@ function getEnhancedPath(): string {
   return paths.join(":")
 }
 
-function splitCronExpression(cron: string): [string, string, string, string, string] {
-  const parts = cron.trim().split(/\s+/)
-  if (parts.length !== 5) {
-    throw new Error(`Invalid cron: ${cron}`)
-  }
-  return parts as [string, string, string, string, string]
-}
-
-function uniqueSorted(values: number[]): number[] {
-  return Array.from(new Set(values)).sort((a, b) => a - b)
-}
-
-function parseCronField(
-  field: string,
-  min: number,
-  max: number,
-  label: string,
-  allowSundaySeven = false
-): number[] | null {
-  if (field === "*") return null
-
-  if (field.startsWith("*/")) {
-    const step = parseInt(field.slice(2), 10)
-    if (!Number.isFinite(step) || step <= 0) {
-      throw new Error(`Invalid cron ${label} step: ${field}`)
-    }
-    const values: number[] = []
-    for (let value = min; value <= max; value += step) {
-      values.push(value)
-    }
-    return values
-  }
-
-  const parts = field.split(",")
-  if (parts.length > 1) {
-    const values = parts.map((part) => parseCronNumber(part, min, max, label, allowSundaySeven))
-    return uniqueSorted(values)
-  }
-
-  if (/^\d+$/.test(field)) {
-    return [parseCronNumber(field, min, max, label, allowSundaySeven)]
-  }
-
-  throw new Error(`Invalid cron ${label} field: ${field}`)
-}
-
-function parseCronNumber(
-  value: string,
-  min: number,
-  max: number,
-  label: string,
-  allowSundaySeven: boolean
-): number {
-  const parsed = parseInt(value, 10)
-  if (!Number.isFinite(parsed)) {
-    throw new Error(`Invalid cron ${label} value: ${value}`)
-  }
-  const normalized = allowSundaySeven && parsed === 7 ? 0 : parsed
-  if (normalized < min || normalized > max) {
-    throw new Error(`Invalid cron ${label} value: ${value}`)
-  }
-  return normalized
-}
-
-function validateCronExpression(cron: string): void {
-  const [minute, hour, dayOfMonth, month, dayOfWeek] = splitCronExpression(cron)
-  parseCronField(minute, 0, 59, "minute")
-  parseCronField(hour, 0, 23, "hour")
-  parseCronField(dayOfMonth, 1, 31, "day of month")
-  parseCronField(month, 1, 12, "month")
-  parseCronField(dayOfWeek, 0, 7, "day of week", true)
-}
 
 function expandLaunchdEntries(
   entries: Record<string, number>[],
@@ -808,53 +735,6 @@ function renderLaunchdCalendar(calendar: Record<string, number>): string {
     .join("\n")
 }
 
-const SYSTEMD_WEEKDAYS = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"]
-
-function formatSystemdValue(value: number, size: number): string {
-  return value.toString().padStart(size, "0")
-}
-
-function cronToSystemdCalendars(cron: string): string[] {
-  const [minute, hour, dayOfMonth, month, dayOfWeek] = splitCronExpression(cron)
-  const minuteValues = parseCronField(minute, 0, 59, "minute")
-  const hourValues = parseCronField(hour, 0, 23, "hour")
-  const dayValues = parseCronField(dayOfMonth, 1, 31, "day of month")
-  const monthValues = parseCronField(month, 1, 12, "month")
-  const weekdayValues = parseCronField(dayOfWeek, 0, 7, "day of week", true)
-
-  const minutes = minuteValues ? minuteValues.map((value) => formatSystemdValue(value, 2)) : ["*"]
-  const hours = hourValues ? hourValues.map((value) => formatSystemdValue(value, 2)) : ["*"]
-  const days = dayValues ? dayValues.map((value) => formatSystemdValue(value, 2)) : ["*"]
-  const months = monthValues ? monthValues.map((value) => formatSystemdValue(value, 2)) : ["*"]
-  const weekdays = weekdayValues
-    ? weekdayValues.map((value) => SYSTEMD_WEEKDAYS[value] ?? "*")
-    : ["*"]
-
-  const calendars: string[] = []
-
-  const buildCalendars = (domValues: string[], dowValues: string[]) => {
-    for (const minuteValue of minutes) {
-      for (const hourValue of hours) {
-        for (const domValue of domValues) {
-          for (const monthValue of months) {
-            for (const dowValue of dowValues) {
-              calendars.push(`${dowValue} *-${monthValue}-${domValue} ${hourValue}:${minuteValue}:00`)
-            }
-          }
-        }
-      }
-    }
-  }
-
-  if (dayValues && weekdayValues) {
-    buildCalendars(days, ["*"])
-    buildCalendars(["*"], weekdays)
-  } else {
-    buildCalendars(days, weekdays)
-  }
-
-  return calendars
-}
 
 const WINDOWS_WEEKDAYS = ["SUN", "MON", "TUE", "WED", "THU", "FRI", "SAT"]
 const WINDOWS_MONTHS = ["JAN", "FEB", "MAR", "APR", "MAY", "JUN", "JUL", "AUG", "SEP", "OCT", "NOV", "DEC"]
@@ -1096,6 +976,7 @@ ${calendarXml}
 
 
 function installLaunchdJob(job: Job): void {
+  validateJobIdentifiers(job)
   ensureDir(LAUNCH_AGENTS_DIR)
   ensureDir(LOGS_DIR)
 
@@ -1111,13 +992,13 @@ function installLaunchdJob(job: Job): void {
 
   // Unload if exists
   try {
-    execSync(`launchctl unload "${plistPath}" 2>/dev/null`, { stdio: "ignore" })
+    execFileSync("launchctl", ["unload", plistPath], { stdio: "ignore" })
   } catch {}
 
   // Also unload legacy label (pre-scope)
   if (existsSync(legacyPlistPath)) {
     try {
-      execSync(`launchctl unload "${legacyPlistPath}" 2>/dev/null`, { stdio: "ignore" })
+      execFileSync("launchctl", ["unload", legacyPlistPath], { stdio: "ignore" })
     } catch {}
   }
 
@@ -1126,10 +1007,11 @@ function installLaunchdJob(job: Job): void {
   writeFileSync(plistPath, plist)
 
   // Load
-  execSync(`launchctl load "${plistPath}"`)
+  execFileSync("launchctl", ["load", plistPath])
 }
 
 function uninstallLaunchdJob(job: Job): void {
+  validateJobIdentifiers(job)
   const scopeId = job.scopeId || deriveScopeId(job.workdir || homedir())
   const scopedLabel = `${LAUNCHD_PREFIX}.${scopeId}.${job.slug}`
   const scopedPlistPath = join(LAUNCH_AGENTS_DIR, `${scopedLabel}.plist`)
@@ -1140,7 +1022,7 @@ function uninstallLaunchdJob(job: Job): void {
   for (const plistPath of [scopedPlistPath, legacyPlistPath]) {
     if (!existsSync(plistPath)) continue
     try {
-      execSync(`launchctl unload "${plistPath}"`, { stdio: "ignore" })
+      execFileSync("launchctl", ["unload", plistPath], { stdio: "ignore" })
     } catch {}
     try {
       unlinkSync(plistPath)
@@ -1149,6 +1031,36 @@ function uninstallLaunchdJob(job: Job): void {
 }
 
 // === SYSTEMD (Linux) ===
+
+// Build the environment used for every `systemctl --user ...` /
+// `systemd-analyze` call.
+//
+// The parent opencode process is often launched without `XDG_RUNTIME_DIR`
+// (e.g. via an SSH/systemd service context that does not populate it), which
+// makes `systemctl --user` fail with "Failed to connect to bus" even though a
+// real user manager socket exists. Derive it from the current uid's runtime
+// directory when present, and derive `DBUS_SESSION_BUS_ADDRESS` from it so the
+// user bus is reachable.
+function systemdRunEnv(): NodeJS.ProcessEnv {
+  const enhancedPath = getEnhancedPath()
+  const existingPath = process.env.PATH
+  return withSystemdRuntimeEnv({
+    ...process.env,
+    PATH: existingPath ? `${enhancedPath}:${existingPath}` : enhancedPath,
+  })
+}
+
+function defaultSystemdCommandRunner(
+  executable: "systemctl",
+  args: readonly string[],
+  options?: Parameters<typeof execFileSync>[2]
+): Buffer | string {
+  return execFileSync(executable, [...args], { ...options, env: systemdRunEnv() }) as Buffer | string
+}
+
+function systemdExecSync(args: readonly string[], options?: Parameters<typeof execFileSync>[2]): Buffer | string {
+  return defaultSystemdCommandRunner("systemctl", args, options)
+}
 
 function createSystemdService(job: Job): string {
   const scopeId = job.scopeId || deriveScopeId(job.workdir || homedir())
@@ -1193,7 +1105,8 @@ WantedBy=timers.target
 `
 }
 
-function installSystemdJob(job: Job): void {
+function installSystemdJob(job: Job, run: SystemdCommandRunner = defaultSystemdCommandRunner): void {
+  validateJobIdentifiers(job)
   ensureDir(SYSTEMD_USER_DIR)
   ensureDir(LOGS_DIR)
 
@@ -1204,23 +1117,28 @@ function installSystemdJob(job: Job): void {
   const servicePath = join(SYSTEMD_USER_DIR, `opencode-job-${scopeId}-${job.slug}.service`)
   const timerPath = join(SYSTEMD_USER_DIR, `opencode-job-${scopeId}-${job.slug}.timer`)
 
-  // Also stop/disable legacy units (pre-scope)
-  try {
-    execSync(`systemctl --user stop opencode-job-${job.slug}.timer`, { stdio: "ignore" })
-    execSync(`systemctl --user disable opencode-job-${job.slug}.timer`, { stdio: "ignore" })
-  } catch {}
-
-  // Write service and timer
-  writeFileSync(servicePath, createSystemdService(job))
-  writeFileSync(timerPath, createSystemdTimer(job))
-
-  // Reload and enable
-  execSync("systemctl --user daemon-reload")
-  execSync(`systemctl --user enable opencode-job-${scopeId}-${job.slug}.timer`)
-  execSync(`systemctl --user start opencode-job-${scopeId}-${job.slug}.timer`)
+  const serviceUnit = servicePath.slice(SYSTEMD_USER_DIR.length + 1)
+  const timerUnit = timerPath.slice(SYSTEMD_USER_DIR.length + 1)
+  installSystemdUnits({
+    unitDir: SYSTEMD_USER_DIR,
+    lockDir: join(SCHEDULER_DIR, "systemd-install-locks"),
+    serviceUnit,
+    timerUnit,
+    lockKey: `opencode-job-${job.slug}`,
+    legacyServiceUnit: `opencode-job-${job.slug}.service`,
+    legacyTimerUnit: `opencode-job-${job.slug}.timer`,
+    serviceContent: createSystemdService(job),
+    timerContent: createSystemdTimer(job),
+    run,
+    onWarning(message, error) {
+      const detail = error instanceof Error ? error.message : String(error)
+      console.warn(`[opencode-scheduler] ${message} ${detail}`)
+    },
+  })
 }
 
 function uninstallSystemdJob(job: Job): void {
+  validateJobIdentifiers(job)
   const scopeId = job.scopeId || deriveScopeId(job.workdir || homedir())
 
   const scopedTimerUnit = `opencode-job-${scopeId}-${job.slug}.timer`
@@ -1228,8 +1146,8 @@ function uninstallSystemdJob(job: Job): void {
 
   for (const timerUnit of [scopedTimerUnit, legacyTimerUnit]) {
     try {
-      execSync(`systemctl --user stop ${timerUnit}`, { stdio: "ignore" })
-      execSync(`systemctl --user disable ${timerUnit}`, { stdio: "ignore" })
+      systemdExecSync(["--user", "stop", timerUnit], { stdio: "ignore" })
+      systemdExecSync(["--user", "disable", timerUnit], { stdio: "ignore" })
     } catch {}
   }
 
@@ -1247,13 +1165,14 @@ function uninstallSystemdJob(job: Job): void {
   }
 
   try {
-    execSync("systemctl --user daemon-reload", { stdio: "ignore" })
+    systemdExecSync(["--user", "daemon-reload"], { stdio: "ignore" })
   } catch {}
 }
 
 // === WINDOWS TASK SCHEDULER ===
 
 function installWindowsJob(job: Job): void {
+  validateJobIdentifiers(job)
   // Remove stale task variants before (re)creating current definitions.
   uninstallWindowsJob(job)
 
@@ -1264,6 +1183,7 @@ function installWindowsJob(job: Job): void {
 }
 
 function uninstallWindowsJob(job: Job): void {
+  validateJobIdentifiers(job)
   const candidates = new Set<string>()
   const scopedBase = windowsTaskBaseName(job)
   const legacyBase = `${WINDOWS_TASK_PREFIX}-${job.slug}`
@@ -1286,24 +1206,16 @@ function uninstallWindowsJob(job: Job): void {
 type SchedulerBackend = "launchd" | "systemd" | "schtasks" | "cron"
 
 function isCommandAvailable(command: string): boolean {
-  try {
-    execSync(`command -v ${command}`, {
-      stdio: "ignore",
-      env: buildRunEnvironment(),
-    })
-    return true
-  } catch {
-    return false
-  }
+  if (!/^[a-z0-9][a-z0-9-]*$/.test(command)) return false
+  return resolveExecutable(command, buildRunEnvironment()) !== null
 }
 
 function isSystemdUserAvailable(): boolean {
   if (!IS_LINUX) return false
   if (!isCommandAvailable("systemctl")) return false
   try {
-    execSync("systemctl --user show-environment", {
+    systemdExecSync(["--user", "show-environment"], {
       stdio: "ignore",
-      env: buildRunEnvironment(),
     })
     return true
   } catch {
@@ -1457,28 +1369,25 @@ function resolveSchedulerBackend(): SchedulerBackend {
 }
 
 function installJob(job: Job): SchedulerBackend {
+  validateJobIdentifiers(job)
   const backend = resolveSchedulerBackend()
   if (backend === "launchd") {
     installLaunchdJob(job)
-  } else if (backend === "systemd") {
-    try {
-      installSystemdJob(job)
-    } catch (error) {
-      if (!isCronAvailable()) {
-        throw error
-      }
-      installCronJob(job)
-      return "cron"
-    }
+  } else if (backend === "systemd" || backend === "cron") {
+    return installLinuxScheduler({
+      systemdAvailable: backend === "systemd",
+      installSystemd: () => installSystemdJob(job),
+      isCronAvailable,
+      installCron: () => installCronJob(job),
+    })
   } else if (backend === "schtasks") {
     installWindowsJob(job)
-  } else {
-    installCronJob(job)
   }
   return backend
 }
 
 function uninstallJob(job: Job): void {
+  validateJobIdentifiers(job)
   if (IS_MAC) {
     uninstallLaunchdJob(job)
     return
@@ -2286,14 +2195,7 @@ function loadSchedulerConfig(): SchedulerConfig {
 }
 
 function getOpencodeVersion(opencodePath: string): string | null {
-  try {
-    const output = execSync(`"${opencodePath}" --version`, { env: buildRunEnvironment() })
-      .toString()
-      .trim()
-    return output || null
-  } catch {
-    return null
-  }
+  return readExecutableVersion(opencodePath, buildRunEnvironment())
 }
 
 function runJobNow(job: Job): { startedAt: string; logPath: string; pid?: number; job: Job | null } {
