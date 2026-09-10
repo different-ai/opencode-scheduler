@@ -83,6 +83,7 @@ Windows Task Scheduler limits:
 - Cron expressions that use unsupported combinations (for example, month + weekday constraints, or month-only without explicit day-of-month) return a clear error with guidance.
 - Complex cron schedules may be expanded into multiple Windows tasks under `\\OpenCode\\opencode-job-...`.
 - Windows scheduled runs currently do **not** use the supervisor pipeline used on macOS/Linux, so no-overlap and timeout enforcement are not guaranteed by the OS integration itself.
+- Tasks created before the absolute-binary fix embed a bare `opencode` path with no log redirection: re-save (update) existing jobs under `\\OpenCode\\...` so their `/TR` regenerates with the resolved absolute binary path and `>> <log> 2>&1` output redirect.
 
 ---
 

@@ -617,11 +617,48 @@ function loadPackageInfo(): { name: string; version: string } {
   }
 }
 
+// Windows resolution: where.exe over the enhanced PATH, then well-known
+// install locations. Returns bare "opencode" when every probe misses.
+function findOpencodeWindows(): string {
+  const systemPath = process.env.PATH ?? ""
+  try {
+    const resolved = execSync("where.exe opencode", {
+      env: { ...process.env, PATH: `${getEnhancedPath()};${systemPath}` },
+      stdio: ["ignore", "pipe", "ignore"],
+    })
+      .toString()
+      .trim()
+      .split(/\r?\n/)
+      .map((line) => line.trim())
+      .find((line) => line.length > 0)
+    if (resolved) return resolved
+  } catch {
+    // where.exe missed — fall through to well-known locations.
+  }
+
+  const scoopDir = process.env.SCOOP ?? join(homedir(), "scoop")
+  const candidates = [
+    join(scoopDir, "shims", "opencode.exe"),
+    ...(process.env.APPDATA ? [join(process.env.APPDATA, "npm", "opencode.cmd")] : []),
+    ...(process.env.LOCALAPPDATA
+      ? [join(process.env.LOCALAPPDATA, "Programs", "opencode", "bin", "opencode.exe")]
+      : []),
+    join(homedir(), ".opencode", "bin", "opencode"),
+    join(homedir(), ".opencode", "bin", "opencode.exe"),
+  ]
+  for (const candidate of candidates) {
+    if (existsSync(candidate)) return candidate
+  }
+  return "opencode"
+}
+
 // Find opencode binary
 function findOpencode(): string {
   // Allow explicit override for edge cases (multiple installs, etc.)
   const override = process.env.OPENCODE_SCHEDULER_OPENCODE_PATH?.trim()
   if (override) return override
+
+  if (process.platform === "win32") return findOpencodeWindows()
 
   // Prefer PATH resolution so the scheduler uses the same `opencode` as the user.
   // This fixes cases where an old install exists at ~/.opencode/bin/opencode.
@@ -661,6 +698,20 @@ function findOpencode(): string {
 
 // Get PATH that includes common locations for node/npx
 function getEnhancedPath(): string {
+  if (process.platform === "win32") {
+    const systemRoot = process.env.SystemRoot ?? "C:\\Windows"
+    const scoopDir = process.env.SCOOP ?? join(homedir(), "scoop")
+    const dirs = [
+      join(systemRoot, "System32"),
+      join(scoopDir, "shims"),
+      ...(process.env.APPDATA ? [join(process.env.APPDATA, "npm")] : []),
+      ...(process.env.LOCALAPPDATA
+        ? [join(process.env.LOCALAPPDATA, "Programs", "opencode", "bin")]
+        : []),
+      join(homedir(), ".opencode", "bin"),
+    ]
+    return dirs.join(";")
+  }
   const paths = [
     "/opt/homebrew/bin",
     "/usr/local/bin",
@@ -903,7 +954,9 @@ function getWindowsInvocation(job: Job): JobInvocation {
 
 function buildWindowsTaskCommand(job: Job): string {
   const invocation = getWindowsInvocation(job)
-  return [invocation.command, ...invocation.args].map((arg) => quoteWindowsArg(arg)).join(" ")
+  const base = [invocation.command, ...invocation.args].map((arg) => quoteWindowsArg(arg)).join(" ")
+  const logPath = getLogPath(job)
+  return `cmd.exe /c "${base} >> ${quoteWindowsArg(logPath)} 2>&1"`
 }
 
 function maybeStep(field: string): number | null {
