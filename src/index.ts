@@ -11,8 +11,7 @@
  * - Working directory support for MCP configs
  * - Environment variable injection (PATH for node/npx)
  */
-import type { Plugin } from "@opencode-ai/plugin"
-import { tool } from "@opencode-ai/plugin"
+import { Plugin } from "@opencode/plugin"
 import { createWriteStream, existsSync, mkdirSync, readdirSync, readFileSync, rmSync, writeFileSync, unlinkSync } from "fs"
 import { basename, dirname, join, resolve as resolvePath } from "path"
 import { homedir, platform } from "os"
@@ -120,8 +119,17 @@ function scopedLogPath(scopeId: string, slug: string): string {
   return join(scopeLogsDir(scopeId), `${slug}.log`)
 }
 
+// Default working directory used for scope resolution when a tool call does
+// not specify one explicitly. Initialized from the plugin location at setup
+// time (V2); falls back to the process working directory.
+let DEFAULT_WORKDIR = process.cwd()
+
+function defaultWorkdir(): string {
+  return DEFAULT_WORKDIR
+}
+
 function currentScopeId(): string {
-  return deriveScopeId(process.cwd())
+  return deriveScopeId(defaultWorkdir())
 }
 
 const SUPERVISOR_SCRIPT = `#!/usr/bin/perl
@@ -2532,59 +2540,120 @@ function getJobLogs(job: Job, options?: { tailLines?: number; maxChars?: number 
   }
 }
 
-// === PLUGIN ===
+// === TOOL INPUTS (V2 JSON Schema inputs, parsed by the host) ===
 
-export const SchedulerPlugin: Plugin = async () => {
-  return {
-    tool: {
-       schedule_job: tool({
-           description:
-            "Schedule a recurring job to run an opencode prompt. Uses launchd (Mac), systemd (Linux), Windows Task Scheduler, or cron fallback when needed.",
-          args: {
-           name: tool.schema.string().describe("A short name for the job (e.g. 'standing desk search')"),
-           schedule: tool.schema
-             .string()
-             .describe("Cron expression: '0 9 * * *' (daily 9am), '0 */6 * * *' (every 6h), '30 8 * * 1' (Monday 8:30am)"),
-           prompt: tool.schema.string().optional().describe("Prompt to run (legacy; prefer run fields)"),
-           command: tool.schema.string().optional().describe("Optional: opencode command to run (maps to --command)"),
-           arguments: tool.schema.string().optional().describe("Optional: arguments string for command mode"),
-           files: tool.schema
-             .string()
-             .optional()
-             .describe("Optional: comma-separated list of files/dirs to attach (maps to repeated --file)"),
-           agent: tool.schema.string().optional().describe("Optional: agent to use (maps to --agent)"),
-           model: tool.schema.string().optional().describe("Optional: model to use (maps to --model)"),
-           variant: tool.schema.string().optional().describe("Optional: model variant (maps to --variant)"),
-           title: tool.schema.string().optional().describe("Optional: session title (maps to --title)"),
-           share: tool.schema.boolean().optional().describe("Optional: share session (maps to --share)"),
-           continue: tool.schema.boolean().optional().describe("Optional: continue last session (maps to --continue)"),
-           session: tool.schema.string().optional().describe("Optional: session id (maps to --session)"),
-           runFormat: tool.schema
-             .string()
-             .optional()
-             .describe("Optional: run output format (maps to opencode --format: default|json)"),
-           port: tool.schema.number().optional().describe("Optional: server port for local server (maps to --port)"),
-           source: tool.schema.string().optional().describe("Optional: source app (e.g. 'marketplace') - used for filtering"),
-           workdir: tool.schema
-             .string()
-             .optional()
-             .describe("Optional: working directory to run from (for MCP config). Defaults to current directory."),
-            attachUrl: tool.schema
-              .string()
-              .optional()
-              .describe("Optional: attach URL for opencode run (e.g. http://localhost:4096)."),
-            timeoutSeconds: tool.schema
-              .number()
-              .optional()
-              .describe("Optional: max runtime in seconds (0 disables)."),
-            format: tool.schema.string().optional().describe("Optional: output format ('text' or 'json')."),
-          },
+interface ScheduleJobArgs {
+  name: string
+  schedule: string
+  prompt?: string
+  command?: string
+  arguments?: string
+  files?: string
+  agent?: string
+  model?: string
+  variant?: string
+  title?: string
+  share?: boolean
+  continue?: boolean
+  session?: string
+  runFormat?: string
+  port?: number
+  source?: string
+  workdir?: string
+  attachUrl?: string
+  timeoutSeconds?: number
+  format?: string
+}
 
-          async execute(args) {
+interface ListJobsArgs {
+  source?: string
+  allScopes?: boolean
+  includeLegacy?: boolean
+  scopeRoot?: string
+  format?: string
+}
+
+interface FormatOnlyArgs {
+  format?: string
+}
+
+interface GetSkillArgs {
+  name?: string
+  format?: string
+}
+
+interface InstallSkillArgs {
+  name?: string
+  directory?: string
+  overwrite?: boolean
+  format?: string
+}
+
+interface NamedJobArgs {
+  name: string
+  format?: string
+}
+
+interface UpdateJobArgs {
+  name: string
+  schedule?: string
+  prompt?: string
+  command?: string
+  arguments?: string
+  files?: string
+  agent?: string
+  model?: string
+  variant?: string
+  title?: string
+  share?: boolean
+  continue?: boolean
+  session?: string
+  runFormat?: string
+  port?: number
+  timeoutSeconds?: number
+  workdir?: string
+  attachUrl?: string
+  format?: string
+}
+
+interface RunJobArgs {
+  name: string
+  prompt?: string
+  command?: string
+  arguments?: string
+  files?: string
+  agent?: string
+  model?: string
+  variant?: string
+  title?: string
+  share?: boolean
+  continue?: boolean
+  session?: string
+  runFormat?: string
+  port?: number
+  attachUrl?: string
+  format?: string
+}
+
+interface CleanupGlobalArgs {
+  includeHistory?: boolean
+  confirm?: boolean
+  format?: string
+}
+
+interface JobLogsArgs {
+  name: string
+  lines?: number
+  format?: string
+}
+
+// === TOOL HANDLERS ===
+
+async function handleScheduleJob(args: ScheduleJobArgs): Promise<string> {
             const format = normalizeFormat(args.format)
             const slug = args.source ? `${args.source}-${slugify(args.name)}` : slugify(args.name)
 
-            const workdir = normalizeWorkdirPath(args.workdir || process.cwd())
+            const workdir = normalizeWorkdirPath(args.workdir || defaultWorkdir())
             const scopeId = deriveScopeId(workdir)
 
             if (loadScopedJob(scopeId, slug)) {
@@ -2722,28 +2791,14 @@ Commands:
             const msg = error instanceof Error ? error.message : String(error)
             return errorResult(format, `Failed to schedule job: ${msg}`)
           }
-        },
-      }),
+}
 
-      list_jobs: tool({
-        description: "List all scheduled jobs. Optionally filter by source app.",
-        args: {
-          source: tool.schema.string().optional().describe("Filter by source app (e.g. 'marketplace')"),
-          allScopes: tool.schema.boolean().optional().describe("List jobs across all scopes."),
-          includeLegacy: tool.schema.boolean().optional().describe("Include legacy jobs from ~/.config/opencode/jobs"),
-          scopeRoot: tool.schema
-            .string()
-            .optional()
-            .describe("Optional: scope root directory (defaults to current directory)."),
-          format: tool.schema.string().optional().describe("Optional: output format ('text' or 'json')."),
-        },
-
-        async execute(args) {
+async function handleListJobs(args: ListJobsArgs): Promise<string> {
           const format = normalizeFormat(args.format)
 
           const scopeId = args.allScopes
             ? undefined
-            : deriveScopeId(normalizeWorkdirPath(args.scopeRoot || process.cwd()))
+            : deriveScopeId(normalizeWorkdirPath(args.scopeRoot || defaultWorkdir()))
 
           let jobs = args.allScopes ? loadAllJobsAcrossScopes() : loadAllScopedJobs(scopeId!)
 
@@ -2785,15 +2840,9 @@ Commands:
 
 
           return okResult(format, `Scheduled Jobs\n\n${lines.join("\n\n")}`, { jobs })
-        },
-      }),
+}
 
-      get_version: tool({
-        description: "Show the scheduler plugin version and opencode binary info.",
-        args: {
-          format: tool.schema.string().optional().describe("Optional: output format ('text' or 'json')."),
-        },
-        async execute(args) {
+async function handleGetVersion(args: FormatOnlyArgs): Promise<string> {
           const format = normalizeFormat(args.format)
           const packageInfo = loadPackageInfo()
           const opencodePath = findOpencode()
@@ -2809,19 +2858,9 @@ Commands:
             opencode: { path: opencodePath, version: opencodeVersion },
             platform: platform(),
           })
-        },
-      }),
+}
 
-      get_skill: tool({
-        description: "Get built-in skill templates to copy into your project.",
-        args: {
-          name: tool.schema
-            .string()
-            .optional()
-            .describe("Skill name (default: scheduled-job-best-practices)"),
-          format: tool.schema.string().optional().describe("Optional: output format ('text' or 'json')."),
-        },
-        async execute(args) {
+async function handleGetSkill(args: GetSkillArgs): Promise<string> {
           const format = normalizeFormat(args.format)
           const skill = getBuiltinSkill(args.name)
 
@@ -2849,24 +2888,9 @@ Commands:
           ].join("\n")
 
           return okResult(format, output, { skill })
-        },
-      }),
+}
 
-      install_skill: tool({
-        description: "Install a built-in skill into your repo's .opencode/skill directory.",
-        args: {
-          name: tool.schema
-            .string()
-            .optional()
-            .describe("Skill name (default: scheduled-job-best-practices)"),
-          directory: tool.schema
-            .string()
-            .optional()
-            .describe("Repo root directory to install into (defaults to current directory)."),
-          overwrite: tool.schema.boolean().optional().describe("Overwrite existing files (default false)."),
-          format: tool.schema.string().optional().describe("Optional: output format ('text' or 'json')."),
-        },
-        async execute(args) {
+async function handleInstallSkill(args: InstallSkillArgs): Promise<string> {
           const format = normalizeFormat(args.format)
           const skill = getBuiltinSkill(args.name)
 
@@ -2879,7 +2903,7 @@ Commands:
             return errorResult(format, `No built-in skill found for ${label}. Available: ${available || "(none)"}`)
           }
 
-          const directory = args.directory ?? process.cwd()
+          const directory = args.directory ?? defaultWorkdir()
           const overwrite = args.overwrite === true
 
           try {
@@ -2901,17 +2925,9 @@ Commands:
             const msg = error instanceof Error ? error.message : String(error)
             return errorResult(format, `Failed to install skill: ${msg}`)
           }
-        },
-      }),
+}
 
-      get_job: tool({
-
-        description: "Get details for a scheduled job",
-        args: {
-          name: tool.schema.string().describe("The job name or slug"),
-          format: tool.schema.string().optional().describe("Optional: output format ('text' or 'json')."),
-        },
-        async execute(args) {
+async function handleGetJob(args: NamedJobArgs): Promise<string> {
           const format = normalizeFormat(args.format)
           const job = findJobByName(args.name)
 
@@ -2920,44 +2936,9 @@ Commands:
           }
 
           return okResult(format, formatJobDetails(job), { job })
-        },
-      }),
+}
 
-      update_job: tool({
-        description: "Update a scheduled job",
-        args: {
-          name: tool.schema.string().describe("The job name or slug"),
-          schedule: tool.schema.string().optional().describe("Updated cron expression"),
-
-          // Legacy prompt field
-          prompt: tool.schema.string().optional().describe("Updated prompt (legacy; prefer command/arguments/etc)"),
-
-          command: tool.schema.string().optional().describe("Updated opencode command (maps to --command)"),
-          arguments: tool.schema.string().optional().describe("Updated command arguments string"),
-          files: tool.schema
-            .string()
-            .optional()
-            .describe("Updated comma-separated list of files/dirs to attach"),
-          agent: tool.schema.string().optional().describe("Updated agent (maps to --agent)"),
-          model: tool.schema.string().optional().describe("Updated model (maps to --model)"),
-          variant: tool.schema.string().optional().describe("Updated model variant (maps to --variant)"),
-          title: tool.schema.string().optional().describe("Updated session title (maps to --title)"),
-          share: tool.schema.boolean().optional().describe("Updated share flag (maps to --share)"),
-          continue: tool.schema.boolean().optional().describe("Updated continue flag (maps to --continue)"),
-          session: tool.schema.string().optional().describe("Updated session id (maps to --session)"),
-          runFormat: tool.schema
-            .string()
-            .optional()
-            .describe("Updated run output format (default|json)"),
-          port: tool.schema.number().optional().describe("Updated port (maps to --port)"),
-
-          timeoutSeconds: tool.schema.number().optional().describe("Updated timeout in seconds (0 disables)"),
-
-          workdir: tool.schema.string().optional().describe("Updated working directory"),
-          attachUrl: tool.schema.string().optional().describe("Updated attach URL (set to empty to clear)"),
-          format: tool.schema.string().optional().describe("Optional: output format ('text' or 'json')."),
-        },
-        async execute(args) {
+async function handleUpdateJob(args: UpdateJobArgs): Promise<string> {
           const format = normalizeFormat(args.format)
           const job = findJobByName(args.name)
 
@@ -3104,16 +3085,9 @@ Commands:
             } catch {}
             return errorResult(format, `Failed to update job: ${msg}`)
           }
-        },
-      }),
+}
 
-      delete_job: tool({
-        description: "Delete a scheduled job",
-        args: {
-          name: tool.schema.string().describe("The job name or slug to delete"),
-          format: tool.schema.string().optional().describe("Optional: output format ('text' or 'json')."),
-        },
-        async execute(args) {
+async function handleDeleteJob(args: NamedJobArgs): Promise<string> {
           const format = normalizeFormat(args.format)
           const job = findJobByName(args.name)
 
@@ -3133,24 +3107,9 @@ Commands:
           }
 
           return okResult(format, `Deleted job "${job.name}"`, { job })
-        },
-      }),
+}
 
-      cleanup_global: tool({
-        description:
-          "Clean up scheduler artifacts globally across all scopes. Removes job definitions everywhere; optionally remove logs and run history.",
-        args: {
-          includeHistory: tool.schema
-            .boolean()
-            .optional()
-            .describe("Also remove run history and logs across all scopes (default false)."),
-          confirm: tool.schema
-            .boolean()
-            .optional()
-            .describe("Set true to execute deletion. Default is dry run with no destructive changes."),
-          format: tool.schema.string().optional().describe("Optional: output format ('text' or 'json')."),
-        },
-        async execute(args) {
+async function handleCleanupGlobal(args: CleanupGlobalArgs): Promise<string> {
           const format = normalizeFormat(args.format)
           const includeHistory = args.includeHistory === true
           const dryRun = args.confirm !== true
@@ -3167,31 +3126,9 @@ Commands:
             scopeIds: plan.scopeIds,
             jobsConsidered: plan.jobsToUninstall.length,
           })
-        },
-      }),
+}
 
-      run_job: tool({
-        description: "Run a scheduled job immediately",
-        args: {
-          name: tool.schema.string().describe("The job name or slug"),
-          // Optional overrides for a one-off run
-          prompt: tool.schema.string().optional().describe("Override prompt for this run"),
-          command: tool.schema.string().optional().describe("Override command for this run"),
-          arguments: tool.schema.string().optional().describe("Override arguments for command mode"),
-          files: tool.schema.string().optional().describe("Override comma-separated files/dirs to attach"),
-          agent: tool.schema.string().optional().describe("Override agent"),
-          model: tool.schema.string().optional().describe("Override model"),
-          variant: tool.schema.string().optional().describe("Override variant"),
-          title: tool.schema.string().optional().describe("Override title"),
-          share: tool.schema.boolean().optional().describe("Override share flag"),
-          continue: tool.schema.boolean().optional().describe("Override continue flag"),
-          session: tool.schema.string().optional().describe("Override session id"),
-          runFormat: tool.schema.string().optional().describe("Override run output format (default|json)"),
-          port: tool.schema.number().optional().describe("Override port"),
-          attachUrl: tool.schema.string().optional().describe("Override attach URL"),
-          format: tool.schema.string().optional().describe("Optional: output format ('text' or 'json')."),
-        },
-        async execute(args) {
+async function handleRunJob(args: RunJobArgs): Promise<string> {
           const format = normalizeFormat(args.format)
           const job = findJobByName(args.name)
 
@@ -3271,20 +3208,9 @@ Commands:
               pid: runResult.pid,
             }
           )
-        },
-      }),
+}
 
-      job_logs: tool({
-        description: "View the latest logs from a scheduled job",
-        args: {
-          name: tool.schema.string().describe("The job name or slug"),
-          lines: tool.schema
-            .number()
-            .optional()
-            .describe("Number of lines from the end of the log (default 200)."),
-          format: tool.schema.string().optional().describe("Optional: output format ('text' or 'json')."),
-        },
-        async execute(args) {
+async function handleJobLogs(args: JobLogsArgs): Promise<string> {
           const format = normalizeFormat(args.format)
           const job = findJobByName(args.name)
 
@@ -3305,11 +3231,285 @@ Commands:
           }
 
           return okResult(format, `Logs for ${job.name}\n\n${logs}`, { job, logPath, logs })
-        },
-      }),
+}
+// === TOOL SCHEMAS (V2 JSON Schema) ===
+
+const ScheduleJobInput = {
+  type: "object",
+  properties: {
+    name: { type: "string", description: "A short name for the job (e.g. 'standing desk search')" },
+    schedule: {
+      type: "string",
+      description: "Cron expression: '0 9 * * *' (daily 9am), '0 */6 * * *' (every 6h), '30 8 * * 1' (Monday 8:30am)",
     },
-  }
+    prompt: { type: "string", description: "Prompt to run (legacy; prefer run fields)" },
+    command: { type: "string", description: "Optional: opencode command to run (maps to --command)" },
+    arguments: { type: "string", description: "Optional: arguments string for command mode" },
+    files: {
+      type: "string",
+      description: "Optional: comma-separated list of files/dirs to attach (maps to repeated --file)",
+    },
+    agent: { type: "string", description: "Optional: agent to use (maps to --agent)" },
+    model: { type: "string", description: "Optional: model to use (maps to --model)" },
+    variant: { type: "string", description: "Optional: model variant (maps to --variant)" },
+    title: { type: "string", description: "Optional: session title (maps to --title)" },
+    share: { type: "boolean", description: "Optional: share session (maps to --share)" },
+    continue: { type: "boolean", description: "Optional: continue last session (maps to --continue)" },
+    session: { type: "string", description: "Optional: session id (maps to --session)" },
+    runFormat: { type: "string", description: "Optional: run output format (maps to opencode --format: default|json)" },
+    port: { type: "number", description: "Optional: server port for local server (maps to --port)" },
+    source: { type: "string", description: "Optional: source app (e.g. 'marketplace') - used for filtering" },
+    workdir: {
+      type: "string",
+      description: "Optional: working directory to run from (for MCP config). Defaults to current directory.",
+    },
+    attachUrl: { type: "string", description: "Optional: attach URL for opencode run (e.g. http://localhost:4096)." },
+    timeoutSeconds: { type: "number", description: "Optional: max runtime in seconds (0 disables)." },
+    format: { type: "string", description: "Optional: output format ('text' or 'json')." },
+  },
+  required: ["name", "schedule"],
+  additionalProperties: false,
 }
 
-// Default export for OpenCode plugin system
-export default SchedulerPlugin
+const ListJobsInput = {
+  type: "object",
+  properties: {
+    source: { type: "string", description: "Filter by source app (e.g. 'marketplace')" },
+    allScopes: { type: "boolean", description: "List jobs across all scopes." },
+    includeLegacy: { type: "boolean", description: "Include legacy jobs from ~/.config/opencode/jobs" },
+    scopeRoot: { type: "string", description: "Optional: scope root directory (defaults to current directory)." },
+    format: { type: "string", description: "Optional: output format ('text' or 'json')." },
+  },
+  required: [],
+  additionalProperties: false,
+}
+
+const GetVersionInput = {
+  type: "object",
+  properties: {
+    format: { type: "string", description: "Optional: output format ('text' or 'json')." },
+  },
+  required: [],
+  additionalProperties: false,
+}
+
+const GetSkillInput = {
+  type: "object",
+  properties: {
+    name: { type: "string", description: "Skill name (default: scheduled-job-best-practices)" },
+    format: { type: "string", description: "Optional: output format ('text' or 'json')." },
+  },
+  required: [],
+  additionalProperties: false,
+}
+
+const InstallSkillInput = {
+  type: "object",
+  properties: {
+    name: { type: "string", description: "Skill name (default: scheduled-job-best-practices)" },
+    directory: { type: "string", description: "Repo root directory to install into (defaults to current directory)." },
+    overwrite: { type: "boolean", description: "Overwrite existing files (default false)." },
+    format: { type: "string", description: "Optional: output format ('text' or 'json')." },
+  },
+  required: [],
+  additionalProperties: false,
+}
+
+const NamedJobInput = {
+  type: "object",
+  properties: {
+    name: { type: "string", description: "The job name or slug" },
+    format: { type: "string", description: "Optional: output format ('text' or 'json')." },
+  },
+  required: ["name"],
+  additionalProperties: false,
+}
+
+const DeleteJobInput = {
+  type: "object",
+  properties: {
+    name: { type: "string", description: "The job name or slug to delete" },
+    format: { type: "string", description: "Optional: output format ('text' or 'json')." },
+  },
+  required: ["name"],
+  additionalProperties: false,
+}
+
+const UpdateJobInput = {
+  type: "object",
+  properties: {
+    name: { type: "string", description: "The job name or slug" },
+    schedule: { type: "string", description: "Updated cron expression" },
+    prompt: { type: "string", description: "Updated prompt (legacy; prefer command/arguments/etc)" },
+    command: { type: "string", description: "Updated opencode command (maps to --command)" },
+    arguments: { type: "string", description: "Updated command arguments string" },
+    files: { type: "string", description: "Updated comma-separated list of files/dirs to attach" },
+    agent: { type: "string", description: "Updated agent (maps to --agent)" },
+    model: { type: "string", description: "Updated model (maps to --model)" },
+    variant: { type: "string", description: "Updated model variant (maps to --variant)" },
+    title: { type: "string", description: "Updated session title (maps to --title)" },
+    share: { type: "boolean", description: "Updated share flag (maps to --share)" },
+    continue: { type: "boolean", description: "Updated continue flag (maps to --continue)" },
+    session: { type: "string", description: "Updated session id (maps to --session)" },
+    runFormat: { type: "string", description: "Updated run output format (default|json)" },
+    port: { type: "number", description: "Updated port (maps to --port)" },
+    timeoutSeconds: { type: "number", description: "Updated timeout in seconds (0 disables)" },
+    workdir: { type: "string", description: "Updated working directory" },
+    attachUrl: { type: "string", description: "Updated attach URL (set to empty to clear)" },
+    format: { type: "string", description: "Optional: output format ('text' or 'json')." },
+  },
+  required: ["name"],
+  additionalProperties: false,
+}
+
+const CleanupGlobalInput = {
+  type: "object",
+  properties: {
+    includeHistory: {
+      type: "boolean",
+      description: "Also remove run history and logs across all scopes (default false).",
+    },
+    confirm: { type: "boolean", description: "Set true to execute deletion. Default is dry run with no destructive changes." },
+    format: { type: "string", description: "Optional: output format ('text' or 'json')." },
+  },
+  required: [],
+  additionalProperties: false,
+}
+
+const RunJobInput = {
+  type: "object",
+  properties: {
+    name: { type: "string", description: "The job name or slug" },
+    prompt: { type: "string", description: "Override prompt for this run" },
+    command: { type: "string", description: "Override command for this run" },
+    arguments: { type: "string", description: "Override arguments for command mode" },
+    files: { type: "string", description: "Override comma-separated files/dirs to attach" },
+    agent: { type: "string", description: "Override agent" },
+    model: { type: "string", description: "Override model" },
+    variant: { type: "string", description: "Override variant" },
+    title: { type: "string", description: "Override title" },
+    share: { type: "boolean", description: "Override share flag" },
+    continue: { type: "boolean", description: "Override continue flag" },
+    session: { type: "string", description: "Override session id" },
+    runFormat: { type: "string", description: "Override run output format (default|json)" },
+    port: { type: "number", description: "Override port" },
+    attachUrl: { type: "string", description: "Override attach URL" },
+    format: { type: "string", description: "Optional: output format ('text' or 'json')." },
+  },
+  required: ["name"],
+  additionalProperties: false,
+}
+
+const JobLogsInput = {
+  type: "object",
+  properties: {
+    name: { type: "string", description: "The job name or slug" },
+    lines: { type: "number", description: "Number of lines from the end of the log (default 200)." },
+    format: { type: "string", description: "Optional: output format ('text' or 'json')." },
+  },
+  required: ["name"],
+  additionalProperties: false,
+}
+
+// === PLUGIN (V2) ===
+
+export default Plugin.define({
+  id: "opencode-scheduler",
+  async setup(ctx) {
+    if (ctx.location.directory) {
+      DEFAULT_WORKDIR = ctx.location.directory
+    }
+    await ctx.tool.transform((editor) => {
+      editor.add({
+        name: "schedule_job",
+        description:
+          "Schedule a recurring job to run an opencode prompt. Uses launchd (Mac), systemd (Linux), Windows Task Scheduler, or cron fallback when needed.",
+        input: ScheduleJobInput,
+        async execute(input: unknown) {
+          return { content: await handleScheduleJob(input as ScheduleJobArgs) }
+        },
+      })
+      editor.add({
+        name: "list_jobs",
+        description: "List all scheduled jobs. Optionally filter by source app.",
+        input: ListJobsInput,
+        async execute(input: unknown) {
+          return { content: await handleListJobs(input as ListJobsArgs) }
+        },
+      })
+      editor.add({
+        name: "get_version",
+        description: "Show the scheduler plugin version and opencode binary info.",
+        input: GetVersionInput,
+        async execute(input: unknown) {
+          return { content: await handleGetVersion(input as FormatOnlyArgs) }
+        },
+      })
+      editor.add({
+        name: "get_skill",
+        description: "Get built-in skill templates to copy into your project.",
+        input: GetSkillInput,
+        async execute(input: unknown) {
+          return { content: await handleGetSkill(input as GetSkillArgs) }
+        },
+      })
+      editor.add({
+        name: "install_skill",
+        description: "Install a built-in skill into your repo's .opencode/skill directory.",
+        input: InstallSkillInput,
+        async execute(input: unknown) {
+          return { content: await handleInstallSkill(input as InstallSkillArgs) }
+        },
+      })
+      editor.add({
+        name: "get_job",
+        description: "Get details for a scheduled job",
+        input: NamedJobInput,
+        async execute(input: unknown) {
+          return { content: await handleGetJob(input as NamedJobArgs) }
+        },
+      })
+      editor.add({
+        name: "update_job",
+        description: "Update a scheduled job",
+        input: UpdateJobInput,
+        async execute(input: unknown) {
+          return { content: await handleUpdateJob(input as UpdateJobArgs) }
+        },
+      })
+      editor.add({
+        name: "delete_job",
+        description: "Delete a scheduled job",
+        input: DeleteJobInput,
+        async execute(input: unknown) {
+          return { content: await handleDeleteJob(input as NamedJobArgs) }
+        },
+      })
+      editor.add({
+        name: "cleanup_global",
+        description:
+          "Clean up scheduler artifacts globally across all scopes. Removes job definitions everywhere; optionally remove logs and run history.",
+        input: CleanupGlobalInput,
+        async execute(input: unknown) {
+          return { content: await handleCleanupGlobal(input as CleanupGlobalArgs) }
+        },
+      })
+      editor.add({
+        name: "run_job",
+        description: "Run a scheduled job immediately",
+        input: RunJobInput,
+        async execute(input: unknown) {
+          return { content: await handleRunJob(input as RunJobArgs) }
+        },
+      })
+      editor.add({
+        name: "job_logs",
+        description: "View the latest logs from a scheduled job",
+        input: JobLogsInput,
+        async execute(input: unknown) {
+          return { content: await handleJobLogs(input as JobLogsArgs) }
+        },
+      })
+    })
+  },
+})

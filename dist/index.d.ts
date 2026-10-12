@@ -11,6 +11,6 @@
  * - Working directory support for MCP configs
  * - Environment variable injection (PATH for node/npx)
  */
-import type { Plugin } from "@opencode-ai/plugin";
-export declare const SchedulerPlugin: Plugin;
-export default SchedulerPlugin;
+import { Plugin } from "@opencode/plugin";
+declare const _default: Plugin.Plugin;
+export default _default;

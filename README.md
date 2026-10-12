@@ -16,9 +16,11 @@ Add to your `opencode.json`:
 
 ```json
 {
-  "plugin": ["opencode-scheduler"]
+  "plugins": ["opencode-scheduler"]
 }
 ```
+
+> Requires OpenCode `2.x` and `opencode-scheduler` `2.x`. (For OpenCode `1.x`, use `opencode-scheduler` `1.x` with the `"plugin"` key.)
 
 ## Examples
 
