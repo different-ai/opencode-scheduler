@@ -76,7 +76,17 @@ Jobs run from the working directory where you created them, picking up your `ope
 | macOS | `launchd` | Full support (supervised scheduled runs) |
 | Linux (systemd available) | `systemd --user` | Full support (supervised scheduled runs) |
 | Linux / POSIX (no systemd) | `cron` (`crontab`) | Fallback backend (no missed-run catch-up) |
+| Linux (Alpine/OpenRC, busybox) | `cron` (`crontab`) | Supported with the `crond` service (see below) |
 | Windows | `schtasks` (Task Scheduler) | Supported with cron subset mapping (see limits below) |
+
+On Alpine/OpenRC systems the fallback backend uses busybox `crontab`.
+Install Perl first (`apk add perl`) and make sure the cron daemon is enabled: `rc-service crond start` and `rc-update add crond default`.
+The plugin warns when it installs a cron job while `crond` is not running, and installs crontabs through a temporary file so older busybox builds work too.
+
+Scheduled runs are executed by a small Perl supervisor script (`~/.config/opencode/scheduler/supervisor.pl`).
+Perl is preinstalled on macOS and most Linux distributions; on minimal systems install it first (for example `apk add perl` on Alpine).
+The plugin resolves the interpreter when a job is scheduled (PATH first, then common install locations) and reports a clear error if Perl is missing.
+Set `OPENCODE_SCHEDULER_PERL_PATH` to force a specific perl binary.
 
 Windows Task Scheduler limits:
 
@@ -223,6 +233,8 @@ Then add `@scheduled-job-best-practices` at the top of scheduled job prompts.
 1. Check if installed:
    - Mac: `launchctl list | grep opencode`
    - Linux: `systemctl --user list-timers | grep opencode`
+
+   - Linux (Alpine/OpenRC): `crontab -l` and `rc-service crond status`
    - Windows: `schtasks /Query /TN "\\OpenCode\\opencode-job-*"`
 
 2. Check logs: `Show logs for my-job`
