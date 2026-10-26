@@ -17,6 +17,7 @@
   "scripts": {
     "build": "bun build src/index.ts --outdir dist --target bun --format esm && tsc --emitDeclarationOnly",
     "clean": "rm -rf dist",
+    "test": "bun test",
     "prepublishOnly": "bun run clean && bun run build",
     "release:patch": "npm version patch && npm publish",
     "release:minor": "npm version minor && npm publish",
