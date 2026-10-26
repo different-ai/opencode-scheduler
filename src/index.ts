@@ -124,7 +124,7 @@ function currentScopeId(): string {
   return deriveScopeId(process.cwd())
 }
 
-const SUPERVISOR_SCRIPT = `#!/usr/bin/perl
+const SUPERVISOR_SCRIPT = `#!/usr/bin/env perl
 use strict;
 use warnings;
 use JSON::PP;
@@ -672,6 +672,62 @@ function getEnhancedPath(): string {
   return paths.join(":")
 }
 
+// Common perl interpreter locations. macOS and most Linux distros ship perl,
+// but minimal images (e.g. Alpine) need `apk add perl` first.
+const PERL_FALLBACK_PATHS = ["/usr/bin/perl", "/usr/local/bin/perl", "/opt/homebrew/bin/perl"]
+
+function missingPerlError(): Error {
+  return new Error(
+    [
+      "Perl is required to run supervised scheduled jobs, but no perl interpreter was found.",
+      "Install it with your package manager (Alpine: apk add perl; Debian/Ubuntu: apt-get install perl; Fedora: dnf install perl; macOS ships with perl),",
+      "or set OPENCODE_SCHEDULER_PERL_PATH to an absolute path to a perl interpreter.",
+    ].join(" ")
+  )
+}
+
+// Pure resolution order (exported for tests): explicit override, PATH lookup,
+// then well-known install locations.
+export function resolvePerlPath(options: {
+  override?: string
+  whichPerl: () => string | null
+  fileExists: (path: string) => boolean
+}): string {
+  const override = options.override?.trim()
+  if (override) return override
+
+  const resolved = options.whichPerl()
+  if (resolved) return resolved
+
+  for (const candidate of PERL_FALLBACK_PATHS) {
+    if (options.fileExists(candidate)) return candidate
+  }
+
+  throw missingPerlError()
+}
+
+// Find the perl interpreter used by the supervisor script.
+// Scheduled runs (launchd/systemd/cron) exec: perl supervisor.pl <job.json>
+function findPerl(): string {
+  return resolvePerlPath({
+    override: process.env.OPENCODE_SCHEDULER_PERL_PATH,
+    whichPerl: () => {
+      try {
+        const resolved = execSync("command -v perl", {
+          env: { ...process.env, PATH: getEnhancedPath() + ":" + (process.env.PATH ?? "") },
+          stdio: ["ignore", "pipe", "ignore"],
+        })
+          .toString()
+          .trim()
+        return resolved || null
+      } catch {
+        return null
+      }
+    },
+    fileExists: existsSync,
+  })
+}
+
 function splitCronExpression(cron: string): [string, string, string, string, string] {
   const parts = cron.trim().split(/\s+/)
   if (parts.length !== 5) {
@@ -1049,7 +1105,7 @@ function createLaunchdPlist(job: Job): string {
           .join("\n")}\n  </array>`
 
   const programArgumentsXml = [
-    `    <string>${escapePlistString("/usr/bin/perl")}</string>`,
+    `    <string>${escapePlistString(findPerl())}</string>`,
     `    <string>${escapePlistString(SUPERVISOR_PATH)}</string>`,
     `    <string>${escapePlistString(jobPath)}</string>`,
   ].join("\n")
@@ -1157,7 +1213,7 @@ function createSystemdService(job: Job): string {
   const workdir = job.workdir || homedir()
   const enhancedPath = getEnhancedPath()
 
-  const execStart = ["/usr/bin/perl", SUPERVISOR_PATH, jobPath]
+  const execStart = [findPerl(), SUPERVISOR_PATH, jobPath]
     .map((arg) => `"${escapeSystemdArg(arg)}"`)
     .join(" ")
 
@@ -1404,12 +1460,13 @@ function createCronEntry(job: Job): string {
   const scopeId = job.scopeId || deriveScopeId(job.workdir || homedir())
   const jobPath = jobFilePath(scopeId, job.slug)
   const logFilePath = scopedLogPath(scopeId, job.slug)
+  const escapedPerl = shellEscapeDoubleQuoted(findPerl())
   const escapedSupervisor = shellEscapeDoubleQuoted(SUPERVISOR_PATH)
   const escapedJobPath = shellEscapeDoubleQuoted(jobPath)
   const escapedLogPath = shellEscapeDoubleQuoted(logFilePath)
   const escapedPath = shellEscapeDoubleQuoted(getEnhancedPath())
 
-  return `${job.schedule} PATH="${escapedPath}" /usr/bin/perl "${escapedSupervisor}" "${escapedJobPath}" >> "${escapedLogPath}" 2>&1`
+  return `${job.schedule} PATH="${escapedPath}" "${escapedPerl}" "${escapedSupervisor}" "${escapedJobPath}" >> "${escapedLogPath}" 2>&1`
 }
 
 function installCronJob(job: Job): void {

@@ -78,6 +78,11 @@ Jobs run from the working directory where you created them, picking up your `ope
 | Linux / POSIX (no systemd) | `cron` (`crontab`) | Fallback backend (no missed-run catch-up) |
 | Windows | `schtasks` (Task Scheduler) | Supported with cron subset mapping (see limits below) |
 
+Scheduled runs are executed by a small Perl supervisor script (`~/.config/opencode/scheduler/supervisor.pl`).
+Perl is preinstalled on macOS and most Linux distributions; on minimal systems install it first (for example `apk add perl` on Alpine).
+The plugin resolves the interpreter when a job is scheduled (PATH first, then common install locations) and reports a clear error if Perl is missing.
+Set `OPENCODE_SCHEDULER_PERL_PATH` to force a specific perl binary.
+
 Windows Task Scheduler limits:
 
 - Cron expressions that use unsupported combinations (for example, month + weekday constraints, or month-only without explicit day-of-month) return a clear error with guidance.
