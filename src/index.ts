@@ -12,6 +12,8 @@
  * - Environment variable injection (PATH for node/npx)
  */
 import type { Plugin, PluginInput } from "@opencode-ai/plugin"
+// Types only, so nothing from the 2.x SDK is bundled. The tools are built with the 1.x SDK.
+import type { Plugin as Plugin2 } from "@opencode/plugin"
 import { tool } from "@opencode-ai/plugin"
 import { createWriteStream, existsSync, mkdirSync, readdirSync, readFileSync, rmSync, writeFileSync, unlinkSync } from "fs"
 import { basename, dirname, join, resolve as resolvePath } from "path"
@@ -3418,28 +3420,13 @@ Commands:
   }
 }
 
-// The parts of the OpenCode 2 plugin context used below. They are declared here because the tools
-// are written against the 1.x SDK, and the 2.x SDK is a separate package.
-type ToolCall2 = { sessionID: string; messageID: string; agent: string; signal: AbortSignal }
-type Tool2 = {
-  name: string
-  description: string
-  input: unknown
-  options: { codemode: boolean }
-  execute(input: unknown, call: ToolCall2): Promise<{ content: string }>
-}
-type PluginContext2 = {
-  location: { directory: string }
-  session: { get(input: { sessionID: string }): Promise<{ location?: { directory?: string } }> }
-  tool: { transform(callback: (editor: { add(tool: Tool2): void }) => void): Promise<unknown> }
-}
-
 // OpenCode 2 entrypoint: registers the same tools the 1.x entrypoint returns.
-async function setup(ctx: Partial<PluginContext2>): Promise<void> {
+async function setup(ctx: Plugin2.Context): Promise<void> {
   // Recent OpenCode 1 releases call `setup` as well as `server`, with a context that has no tool or
   // session API. Only a context that can register tools is OpenCode 2.
-  if (typeof ctx?.tool?.transform !== "function" || typeof ctx.session?.get !== "function") return
-  const { tool: tools2, session, location } = ctx as PluginContext2
+  const host: Partial<Plugin2.Context> | undefined = ctx
+  if (typeof host?.tool?.transform !== "function" || typeof host.session?.get !== "function") return
+  const { tool: tools2, session, location } = ctx
   hostMajor = 2
   const hooks = await SchedulerPlugin({} as PluginInput)
   const tools = Object.entries(hooks.tool ?? {}).map(([name, definition]) => {
@@ -3472,5 +3459,9 @@ async function setup(ctx: Partial<PluginContext2>): Promise<void> {
   })
 }
 
-// OpenCode 2 reads `id` and `setup`; OpenCode 1 reads `server`.
-export default { id: "opencode-scheduler", server: SchedulerPlugin, setup }
+// OpenCode 2 reads `id` and `setup`; OpenCode 1 reads `server`. `setup` is checked against the 2.x
+// SDK here and exported with a loose parameter, so the published declarations do not need the 2.x
+// SDK, which is a dev dependency.
+const plugin = { id: "opencode-scheduler", setup } satisfies Plugin2.Plugin
+const entry: { id: string; server: Plugin; setup(context: any): Promise<void> } = { ...plugin, server: SchedulerPlugin }
+export default entry

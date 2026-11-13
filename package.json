@@ -21,7 +21,8 @@
     "release:patch": "npm version patch && npm publish",
     "release:minor": "npm version minor && npm publish",
     "release:major": "npm version major && npm publish",
-    "typecheck": "tsc --noEmit"
+    "typecheck": "tsc --noEmit",
+    "test": "bun run build && sh test/run.sh"
   },
   "keywords": [
     "opencode",
@@ -47,6 +48,7 @@
     "@opencode-ai/plugin": "^1.0.162"
   },
   "devDependencies": {
+    "@opencode/plugin": "2.2.7",
     "bun-types": "latest",
     "typescript": "^5.7.3"
   },

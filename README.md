@@ -225,6 +225,18 @@ Other differences:
 - **Redirected data directories are kept.** If OpenCode 2 was started with `XDG_CONFIG_HOME`, `XDG_DATA_HOME`, `XDG_CACHE_HOME` or `XDG_STATE_HOME` set, scheduled jobs run with the same values, so they use the same database and config.
 - **Scheduled runs never wait for input.** `opencode run` in OpenCode 2 cancels questions and rejects permission prompts on its own.
 
+## Development
+
+```bash
+bun install
+bun run typecheck   # checks the OpenCode 1 and OpenCode 2 entrypoints against both SDKs
+bun run test        # builds, then runs the plugin against stand-in 1.x and 2.x hosts
+```
+
+The tests run in a temporary home directory with stand-ins for `launchctl`, `systemctl`, `schtasks`, `crontab` and `opencode`, so they never register a real job or read your OpenCode files.
+
+`@opencode-ai/plugin` (OpenCode 1) is a runtime dependency because the tools are defined with it. `@opencode/plugin` (OpenCode 2) is a dev dependency used only for types.
+
 ## Project Philosophy
 
 - This plugin is intentionally a thin wrapper: it schedules `opencode run` via launchd/systemd/schtasks, with cron fallback when native backends are unavailable.

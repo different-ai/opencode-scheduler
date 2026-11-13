@@ -13,46 +13,9 @@
  */
 import type { Plugin } from "@opencode-ai/plugin";
 export declare const SchedulerPlugin: Plugin;
-type ToolCall2 = {
-    sessionID: string;
-    messageID: string;
-    agent: string;
-    signal: AbortSignal;
-};
-type Tool2 = {
-    name: string;
-    description: string;
-    input: unknown;
-    options: {
-        codemode: boolean;
-    };
-    execute(input: unknown, call: ToolCall2): Promise<{
-        content: string;
-    }>;
-};
-type PluginContext2 = {
-    location: {
-        directory: string;
-    };
-    session: {
-        get(input: {
-            sessionID: string;
-        }): Promise<{
-            location?: {
-                directory?: string;
-            };
-        }>;
-    };
-    tool: {
-        transform(callback: (editor: {
-            add(tool: Tool2): void;
-        }) => void): Promise<unknown>;
-    };
-};
-declare function setup(ctx: Partial<PluginContext2>): Promise<void>;
-declare const _default: {
+declare const entry: {
     id: string;
     server: Plugin;
-    setup: typeof setup;
+    setup(context: any): Promise<void>;
 };
-export default _default;
+export default entry;

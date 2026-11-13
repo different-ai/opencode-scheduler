@@ -15070,7 +15070,8 @@ ${logs}`, { job, logPath, logs });
   };
 };
 async function setup(ctx) {
-  if (typeof ctx?.tool?.transform !== "function" || typeof ctx.session?.get !== "function")
+  const host = ctx;
+  if (typeof host?.tool?.transform !== "function" || typeof host.session?.get !== "function")
     return;
   const { tool: tools2, session, location } = ctx;
   hostMajor = 2;
@@ -15103,7 +15104,9 @@ async function setup(ctx) {
     }
   });
 }
-var src_default = { id: "opencode-scheduler", server: SchedulerPlugin, setup };
+var plugin = { id: "opencode-scheduler", setup };
+var entry = { ...plugin, server: SchedulerPlugin };
+var src_default = entry;
 export {
   SchedulerPlugin,
   src_default as default
