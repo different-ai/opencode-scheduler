@@ -12,13 +12,23 @@ As of `v1.2.0`, jobs are scoped by `workdir` (so different projects don't collid
 
 ## Install
 
-Add to your `opencode.json`:
+Add to your `opencode.json`. On OpenCode 2:
+
+```json
+{
+  "plugins": ["opencode-scheduler"]
+}
+```
+
+On OpenCode 1:
 
 ```json
 {
   "plugin": ["opencode-scheduler"]
 }
 ```
+
+The same package works on both. See [OpenCode 2](#opencode-2) for what differs.
 
 ## Examples
 
@@ -193,6 +203,27 @@ If you have an OpenCode backend running via `opencode serve` or `opencode web`, 
 ```
 Update the standing-desk job to use attachUrl http://localhost:4096
 ```
+
+### OpenCode 2
+
+`opencode run` changed in OpenCode 2, so jobs scheduled from it are built differently:
+
+| Job field | OpenCode 1 | OpenCode 2 |
+|-----------|------------|------------|
+| `variant` | `--variant high` | Joined to the model: `--model provider/model#high`. Needs `model`. |
+| `attachUrl` | `--attach <url>` | `--server <url>`. A server with a password also needs `OPENCODE_PASSWORD` in the job's environment. |
+| `command` | `--command <name>` | Not supported. Put the command's instructions in the prompt. |
+| `port`, `share` | `--port`, `--share` | Not supported. |
+
+Scheduling or updating a job with an unsupported field fails with a message naming the field, and the job is left unchanged.
+
+Other differences:
+
+- **Which binary runs the job.** The plugin picks an OpenCode 2 binary: `opencode` on your `PATH` if it is 2.x, then `opencode2`, then the binary the plugin is running in. Set `OPENCODE_SCHEDULER_OPENCODE_PATH` to choose one yourself.
+- **Jobs created by OpenCode 1 keep running OpenCode 1.** A job stores its command line when it is created or updated. To move a job to OpenCode 2, update it from OpenCode 2 (any `update_job` call rebuilds the command line).
+- **Scope follows the session.** OpenCode 2 runs plugins in one background server for all projects, so a job's default working directory and scope come from the session that called the tool.
+- **Redirected data directories are kept.** If OpenCode 2 was started with `XDG_CONFIG_HOME`, `XDG_DATA_HOME`, `XDG_CACHE_HOME` or `XDG_STATE_HOME` set, scheduled jobs run with the same values, so they use the same database and config.
+- **Scheduled runs never wait for input.** `opencode run` in OpenCode 2 cancels questions and rejects permission prompts on its own.
 
 ## Project Philosophy
 

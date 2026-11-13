@@ -11,13 +11,14 @@
  * - Working directory support for MCP configs
  * - Environment variable injection (PATH for node/npx)
  */
-import type { Plugin } from "@opencode-ai/plugin"
+import type { Plugin, PluginInput } from "@opencode-ai/plugin"
 import { tool } from "@opencode-ai/plugin"
 import { createWriteStream, existsSync, mkdirSync, readdirSync, readFileSync, rmSync, writeFileSync, unlinkSync } from "fs"
 import { basename, dirname, join, resolve as resolvePath } from "path"
 import { homedir, platform } from "os"
 import { execFileSync, execSync, spawn, type ChildProcess } from "child_process"
 import { fileURLToPath } from "url"
+import { AsyncLocalStorage } from "async_hooks"
 
 // Storage location - shared with other opencode tools
 const OPENCODE_CONFIG = join(homedir(), ".config", "opencode")
@@ -120,8 +121,20 @@ function scopedLogPath(scopeId: string, slug: string): string {
   return join(scopeLogsDir(scopeId), `${slug}.log`)
 }
 
+// One OpenCode process hosts this plugin, and it is either 1.x or 2.x. The two differ in how a tool
+// learns its working directory, which binary a job should run, and which `opencode run` flags exist.
+let hostMajor: 1 | 2 = 1
+
+// OpenCode 2 runs plugins in a background server shared by every project, so process.cwd() is
+// wherever that server was started. The 2.x entrypoint sets the calling session's directory here.
+const toolDirectory = new AsyncLocalStorage<string>()
+
+function currentDirectory(): string {
+  return toolDirectory.getStore() ?? process.cwd()
+}
+
 function currentScopeId(): string {
-  return deriveScopeId(process.cwd())
+  return deriveScopeId(currentDirectory())
 }
 
 const SUPERVISOR_SCRIPT = `#!/usr/bin/perl
@@ -623,6 +636,11 @@ function findOpencode(): string {
   const override = process.env.OPENCODE_SCHEDULER_OPENCODE_PATH?.trim()
   if (override) return override
 
+  if (hostMajor === 2) {
+    const hosted = findOpencode2()
+    if (hosted) return hosted
+  }
+
   // Prefer PATH resolution so the scheduler uses the same `opencode` as the user.
   // This fixes cases where an old install exists at ~/.opencode/bin/opencode.
   try {
@@ -657,6 +675,45 @@ function findOpencode(): string {
   }
 
   return "opencode" // hope it's in PATH
+}
+
+function resolveOnPath(name: string): string | undefined {
+  try {
+    const resolved = execSync(`command -v ${name}`, {
+      env: { ...process.env, PATH: getEnhancedPath() + ":" + (process.env.PATH ?? "") },
+      stdio: ["ignore", "pipe", "ignore"],
+    })
+      .toString()
+      .trim()
+    return resolved.includes("/") ? resolved : undefined
+  } catch {
+    return undefined
+  }
+}
+
+function opencodeMajorVersion(command: string): number | undefined {
+  try {
+    const output = execFileSync(command, ["--version"], {
+      encoding: "utf-8",
+      stdio: ["ignore", "pipe", "ignore"],
+      timeout: 10000,
+    })
+    const match = output.match(/(\d+)\.\d+\.\d+/)
+    return match ? Number(match[1]) : undefined
+  } catch {
+    return undefined
+  }
+}
+
+// Under OpenCode 2, `opencode` on PATH can still be a 1.x install kept beside it, which rejects the
+// 2.x flags. Prefer a 2.x binary on PATH, whose path survives upgrades, then the binary hosting this
+// plugin.
+function findOpencode2(): string | undefined {
+  for (const name of ["opencode", "opencode2"]) {
+    const resolved = resolveOnPath(name)
+    if (resolved && opencodeMajorVersion(resolved) === 2) return resolved
+  }
+  return /^opencode/i.test(basename(process.execPath)) ? process.execPath : undefined
 }
 
 // Get PATH that includes common locations for node/npx
@@ -2172,6 +2229,8 @@ function buildOpencodeArgs(job: Job): { command: string; args: string[] } {
   const run = normalizeRunSpec(getJobRun(job))
   validateRunSpec(run)
 
+  if (hostMajor === 2) return { command, args: buildRunArgs2(run) }
+
   const args = ["run"]
 
   if (run.attachUrl) {
@@ -2226,6 +2285,54 @@ function buildOpencodeArgs(job: Job): { command: string; args: string[] } {
   args.push(run.command ? run.arguments ?? "" : run.prompt ?? "")
 
   return { command, args }
+}
+
+// `opencode run` in 2.x has no --command, --port or --share, takes the variant as part of --model,
+// and reaches another server with --server. An unknown flag makes it print its help and exit 1, so
+// reject what cannot be expressed when the job is saved instead of on every scheduled run.
+function buildRunArgs2(run: JobRunSpec): string[] {
+  const unsupported = [
+    run.command ? "command" : "",
+    run.port !== undefined ? "port" : "",
+    run.share ? "share" : "",
+  ].filter(Boolean)
+  if (unsupported.length > 0) {
+    throw new Error(
+      `OpenCode 2 cannot run a job that sets ${unsupported.join(", ")}: \`opencode run\` no longer has ` +
+        `--command, --port or --share. Remove ${unsupported.length > 1 ? "them" : "it"}; for a command, put its instructions in the prompt.`
+    )
+  }
+  if (run.variant && !run.model) {
+    throw new Error("OpenCode 2 selects a variant as part of the model (provider/model#variant), so variant needs model.")
+  }
+  if (run.variant && run.model?.includes("#")) {
+    throw new Error(`model "${run.model}" already names a variant; remove variant "${run.variant}".`)
+  }
+
+  const args = ["run"]
+  if (run.attachUrl) args.push("--server", run.attachUrl)
+  if (run.agent) args.push("--agent", run.agent)
+  if (run.model) args.push("--model", run.variant ? `${run.model}#${run.variant}` : run.model)
+  if (run.runFormat) args.push("--format", run.runFormat)
+  if (run.title) args.push("--title", run.title)
+  if (run.continue) args.push("--continue")
+  if (run.session) args.push("--session", run.session)
+  for (const file of run.files ?? []) args.push("--file", file)
+  args.push("--", run.prompt ?? "")
+  return args
+}
+
+// The OS scheduler starts a job with a bare environment. OpenCode 2 migrates whichever database it
+// opens, so a job scheduled from an OpenCode that keeps its files somewhere other than the default
+// must run against those same files, never the default ones.
+const OPENCODE_HOME_ENV = ["XDG_CONFIG_HOME", "XDG_DATA_HOME", "XDG_CACHE_HOME", "XDG_STATE_HOME"]
+
+function buildScheduledInvocation(job: Job): JobInvocation {
+  const invocation = buildOpencodeArgs(job)
+  if (hostMajor !== 2 || IS_WINDOWS) return invocation
+  const env = OPENCODE_HOME_ENV.flatMap((name) => (process.env[name] ? [`${name}=${process.env[name]}`] : []))
+  if (env.length === 0) return invocation
+  return { command: "/usr/bin/env", args: [...env, invocation.command, ...invocation.args] }
 }
 
 function buildRunEnvironment(): NodeJS.ProcessEnv {
@@ -2584,7 +2691,7 @@ export const SchedulerPlugin: Plugin = async () => {
             const format = normalizeFormat(args.format)
             const slug = args.source ? `${args.source}-${slugify(args.name)}` : slugify(args.name)
 
-            const workdir = normalizeWorkdirPath(args.workdir || process.cwd())
+            const workdir = normalizeWorkdirPath(args.workdir || currentDirectory())
             const scopeId = deriveScopeId(workdir)
 
             if (loadScopedJob(scopeId, slug)) {
@@ -2675,7 +2782,7 @@ export const SchedulerPlugin: Plugin = async () => {
 
             // Snapshot invocation for supervised scheduled runs.
             try {
-              job.invocation = buildOpencodeArgs(job)
+              job.invocation = buildScheduledInvocation(job)
             } catch (error) {
               const msg = error instanceof Error ? error.message : String(error)
               return errorResult(format, `Failed to build invocation: ${msg}`)
@@ -2743,7 +2850,7 @@ Commands:
 
           const scopeId = args.allScopes
             ? undefined
-            : deriveScopeId(normalizeWorkdirPath(args.scopeRoot || process.cwd()))
+            : deriveScopeId(normalizeWorkdirPath(args.scopeRoot || currentDirectory()))
 
           let jobs = args.allScopes ? loadAllJobsAcrossScopes() : loadAllScopedJobs(scopeId!)
 
@@ -2879,7 +2986,7 @@ Commands:
             return errorResult(format, `No built-in skill found for ${label}. Available: ${available || "(none)"}`)
           }
 
-          const directory = args.directory ?? process.cwd()
+          const directory = args.directory ?? currentDirectory()
           const overwrite = args.overwrite === true
 
           try {
@@ -3066,7 +3173,7 @@ Commands:
 
           // Keep scheduled invocation snapshot up-to-date.
           try {
-            updatedJob.invocation = buildOpencodeArgs(updatedJob)
+            updatedJob.invocation = buildScheduledInvocation(updatedJob)
           } catch (error) {
             const msg = error instanceof Error ? error.message : String(error)
             return errorResult(format, `Failed to build invocation: ${msg}`)
@@ -3311,5 +3418,59 @@ Commands:
   }
 }
 
-// Default export for OpenCode plugin system
-export default SchedulerPlugin
+// The parts of the OpenCode 2 plugin context used below. They are declared here because the tools
+// are written against the 1.x SDK, and the 2.x SDK is a separate package.
+type ToolCall2 = { sessionID: string; messageID: string; agent: string; signal: AbortSignal }
+type Tool2 = {
+  name: string
+  description: string
+  input: unknown
+  options: { codemode: boolean }
+  execute(input: unknown, call: ToolCall2): Promise<{ content: string }>
+}
+type PluginContext2 = {
+  location: { directory: string }
+  session: { get(input: { sessionID: string }): Promise<{ location?: { directory?: string } }> }
+  tool: { transform(callback: (editor: { add(tool: Tool2): void }) => void): Promise<unknown> }
+}
+
+// OpenCode 2 entrypoint: registers the same tools the 1.x entrypoint returns.
+async function setup(ctx: Partial<PluginContext2>): Promise<void> {
+  // Recent OpenCode 1 releases call `setup` as well as `server`, with a context that has no tool or
+  // session API. Only a context that can register tools is OpenCode 2.
+  if (typeof ctx?.tool?.transform !== "function" || typeof ctx.session?.get !== "function") return
+  const { tool: tools2, session, location } = ctx as PluginContext2
+  hostMajor = 2
+  const hooks = await SchedulerPlugin({} as PluginInput)
+  const tools = Object.entries(hooks.tool ?? {}).map(([name, definition]) => {
+    const schema = tool.schema.object(definition.args)
+    return { name, definition, schema, input: tool.schema.toJSONSchema(schema) }
+  })
+
+  await tools2.transform((editor) => {
+    for (const { name, definition, schema, input } of tools) {
+      editor.add({
+        name,
+        description: definition.description,
+        input,
+        options: { codemode: false },
+        execute: async (raw, call) => {
+          const info = await session.get({ sessionID: call.sessionID }).catch(() => undefined)
+          const directory = info?.location?.directory ?? location.directory
+          const content = await toolDirectory.run(directory, () =>
+            definition.execute(schema.parse(raw), {
+              sessionID: call.sessionID,
+              messageID: call.messageID,
+              agent: call.agent,
+              abort: call.signal,
+            })
+          )
+          return { content }
+        },
+      })
+    }
+  })
+}
+
+// OpenCode 2 reads `id` and `setup`; OpenCode 1 reads `server`.
+export default { id: "opencode-scheduler", server: SchedulerPlugin, setup }
