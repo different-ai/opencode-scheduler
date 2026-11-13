@@ -13,4 +13,9 @@
  */
 import type { Plugin } from "@opencode-ai/plugin";
 export declare const SchedulerPlugin: Plugin;
-export default SchedulerPlugin;
+declare const entry: {
+    id: string;
+    server: Plugin;
+    setup(context: any): Promise<void>;
+};
+export default entry;
